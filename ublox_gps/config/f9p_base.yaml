@@ -1,18 +1,29 @@
 # Configuration Settings for C94-M8P device
 ublox_gps_base_node:
   ros__parameters:
-    debug: 0                    # Range 0-4 (0 means no debug statements will print)
+    debug: 3                    # Range 0-4 (0 means no debug statements will print)
 
     device: /dev/ttyACM0
     frame_id: gps_base
 
     uart1:
-      baudrate: 38400
+      baudrate: 460800
 
     config_on_startup: false    # If false, the node will not override configurations of the device on startup
                                 # Device should be configured with u-center and configurations should be saved in flash
                                 # Please use the configuration file provided by Lemvos
 
+    gnss:
+      gps: true
+      galileo: true
+      glonass: true
+      beidou: false
+      qzss: false 
+
+
+
+    inf: 
+      all: true
     # Enable u-blox message publishers
     publish:
       all: false

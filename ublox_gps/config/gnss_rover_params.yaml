@@ -1,23 +1,21 @@
-# Configuration Settings for C94-M8P device
-ublox_gps_rover_node:
+# Configuration Settings for F9H device in Rover Mode
+gnss_rover_node:
   ros__parameters:
-    debug: 4                    # Range 0-4 (0 means no debug statements will print)
+    debug: 0                    # Range 0-4 (0 means no debug statements will print)
 
     device: /dev/ttyACM1
-    frame_id: gps_rover
-
-    uart1:
-      baudrate: 115200
+    frame_id: gnss_rover
 
     config_on_startup: false    # If false, the node will not override configurations of the device on startup
                                 # Device should be configured with u-center and configurations should be saved in flash
                                 # Please use the configuration file provided by Lemvos
     
-    # Enable u-blox message publishers
+    # Enable u-blox gnss message publishers
     publish:
       all: false
       aid:
         hui: false
       nav:
         relposned: true
+      nmea: false
 
