@@ -1,0 +1,78 @@
+name: Build ROS2 Debian Package (ARM64)
+
+on:
+  push:
+    branches: [ "ros2" ]
+  workflow_dispatch:
+
+jobs:
+  build-deb:
+    runs-on:
+      - ubuntu-22.04-arm64
+    container:
+      image: ros:humble-ros-base
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y python3-bloom python3-bloom python3-rosdep fakeroot dpkg-dev debhelper dh-python
+
+      - name: Initialize rosdep
+        run: |
+          rosdep update
+          rosdep install --from-paths . --ignore-src -y
+
+      - name: Build Debian package
+        run: |
+          # Set the package build order
+          set -- ublox_serialization ublox_msgs ublox_gps ublox
+          # Create directory for debs
+          mkdir -p debs
+          
+          while [ $# -gt 0 ]; do
+            echo "Building package: $1"
+            cd "$1"
+            bloom-generate rosdebian
+            fakeroot debian/rules binary
+            # Install the built package for dependency resolution
+            find .. -name "*.deb" -exec dpkg -i {} \; || true
+            # apt-get install -f -y
+            # Move debs to collection directory
+            find .. -name "*.deb" -exec mv {} ../debs/ \;
+            cd ..
+            shift
+          done
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ros2-deb-package
+          path: debs/*.deb
+
+  publish-deb:
+      needs: build-deb
+      runs-on: ubuntu-22.04
+      steps:
+        - name: Download artifact
+          uses: actions/download-artifact@v4
+          with:
+            name: ros2-deb-package
+
+        - name: Setup Cloudsmith CLI
+          uses: cloudsmith-io/cloudsmith-cli-action@v1.0.3
+          with:
+            api-key: ${{ secrets.CLOUDSMITH_API_KEY }}
+
+        - name: Push to Artifactory
+          run: |
+            for deb in *.deb; do
+              cloudsmith push deb \
+                ${{ vars.CLOUDSMITH_OWNER }}/${{ vars.CLOUDSMITH_REPO }}/ubuntu/jammy \
+                "$deb" \
+                --api-key="${{ secrets.CLOUDSMITH_API_KEY }}" \
+                --republish
+            done
