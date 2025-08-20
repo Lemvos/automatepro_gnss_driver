@@ -279,10 +279,12 @@ template <typename StreamT>
 void AsyncWorker<StreamT>::readEnd(const asio::error_code& error,
                                    std::size_t bytes_transferred) {
   std::lock_guard<std::mutex> lock(read_mutex_);
-  if (error) {
+  if (error) {    
     RCLCPP_ERROR(logger_, "U-Blox ASIO input buffer read error: %s, %li",
                  error.message().c_str(),
                  bytes_transferred);
+    // Sleep
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   } else if (bytes_transferred > 0) {
     in_buffer_size_ += bytes_transferred;
 

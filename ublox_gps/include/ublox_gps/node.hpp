@@ -51,6 +51,21 @@
 #include <ublox_gps/rtcm.hpp>
 #include <ublox_gps/raw_data_pa.hpp>
 
+// ROS 2 lifecycle
+#include "lifecycle_msgs/msg/state.hpp"
+#include <rclcpp_lifecycle/lifecycle_node.hpp>
+#include "lifecycle_msgs/msg/transition_description.hpp"
+
+// Watchdog
+#include "ublox_gps/watchdog.hpp"
+
+// GPIO
+#include <gpiod.hpp>
+
+// Debugging: service to enable/disable gps inputs
+#include <std_srvs/srv/set_bool.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+
 // This file also declares UbloxNode which is the main class and ros node. It
 // implements functionality which applies to any u-blox device, regardless of
 // the firmware version or product type.  The class is designed in compositional
@@ -64,6 +79,8 @@
  * ROS parameters, message passing, diagnostics, etc.
  */
 namespace ublox_node {
+
+using LifecycleNodeInterface = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface;
 
 /**
  * @brief This class represents u-blox ROS node for *all* firmware and product
@@ -80,14 +97,14 @@ namespace ublox_node {
  * The UbloxNode calls the public methods of ComponentInterface for each
  * element in the components vector.
  */
-class UbloxNode final : public rclcpp::Node {
+class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
  public:
   //! How long to wait during I/O reset [s]
   constexpr static int kResetWait = 10;
   //! How often (in seconds) to send keep-alive message
   constexpr static double kKeepAlivePeriod = 10.0;
   //! How often (in seconds) to call poll messages
-  constexpr static double kPollDuration = 1.0;
+  constexpr static double kPollDuration = 0.1;
   // Constants used for diagnostic frequency updater
   //! [s] 5Hz diagnostic period
   const float kDiagnosticPeriod = 0.2;
@@ -137,7 +154,6 @@ class UbloxNode final : public rclcpp::Node {
   void printInf(const ublox_msgs::msg::Inf &m, uint8_t id);
 
  private:
-
   /**
    * @brief Callback for '/ntrip_client/rtcm' subscription to handle RTCM correction data
    */
@@ -163,7 +179,7 @@ class UbloxNode final : public rclcpp::Node {
    * @brief Shutdown the node. Closes the serial port.
    */
   void shutdown();
-
+  void shutdown2();
   /**
    * @brief Send a reset message the u-blox device & re-initialize the I/O.
    * @return true if reset was successful, false otherwise.
@@ -299,6 +315,121 @@ class UbloxNode final : public rclcpp::Node {
 
   rclcpp::TimerBase::SharedPtr keep_alive_;
   rclcpp::TimerBase::SharedPtr poller_;
+
+  /* ***********/
+  /* Lifecycle */
+  /* ***********/
+
+  /**
+   * @brief Callback for the Configure transition.
+   * @return CallbackReturn indicating the result of the transition.
+   */  
+  LifecycleNodeInterface::CallbackReturn on_configure(const rclcpp_lifecycle::State & state) override;
+
+  /**
+   * @brief Callback for the Activate transition.
+   * @return CallbackReturn indicating the result of the transition.
+   */  
+  LifecycleNodeInterface::CallbackReturn on_activate(const rclcpp_lifecycle::State & state) override;
+
+  /**
+   * @brief Callback for the Deactivate transition.
+   * @return CallbackReturn indicating the result of the transition.
+   */  
+  LifecycleNodeInterface::CallbackReturn on_deactivate(const rclcpp_lifecycle::State & state) override;
+
+  /**
+   * @brief Callback for the Cleanup transition.
+   * @return CallbackReturn indicating the result of the transition.
+   */  
+  LifecycleNodeInterface::CallbackReturn on_cleanup(const rclcpp_lifecycle::State & state) override;
+
+  /**
+   * @brief Callback for the Shutdown transition.
+   * @return CallbackReturn indicating the result of the transition.
+   */  
+  LifecycleNodeInterface::CallbackReturn on_shutdown(const rclcpp_lifecycle::State & state) override;
+  
+  /* ************** */
+  /* Nav Subscriber */
+  /* ************** */
+
+  /**
+   * @brief Callback for the NavSatFix message.
+   * @param msg The NavSatFix message.
+   */
+  void fixCallback(const sensor_msgs::msg::NavSatFix::SharedPtr msg);
+  
+  // Subscriber for node /ublox_gps_rover_node/fix of type sensor_msgs/msg/NavSatFix
+  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr fix_subscriber_;
+  
+  /* **** */
+  /* GPIO */
+  /* **** */
+
+  /**
+   * @brief Set the GPIO chipname.
+   * @param chipname the GPIO chipname
+   */
+  void open_gpio_chipname(const std::string& chipname);
+  
+  /**
+   * @brief Close the GPIO chipname.
+   */
+  void close_gpio_chipname();
+
+  /**
+   * @brief Set the GPIO line number.
+   * @param line_num the GPIO line number
+   */
+  void open_gpio_line(unsigned int line);
+
+  /**
+   * @brief Close the GPIO line.
+   */
+  void close_gpio_line();
+  
+  /**
+   * @brief GPIO set HIGH or LOW.
+   * @return True is success, False otherwise.
+   */
+  void set_gpio_toggle(bool high);
+  
+  gpiod::chip chip_;                    // GPIO chip
+  gpiod::line line_;                    // GPIO line
+  std::string chipname_ = "gpiochip0";  // Default GPIO chipname
+  unsigned int line_num_ = 134;         // Default GPIO line number
+  int gpio_reset_time_ = 1;             // GPIO reset time in seconds
+  
+  /* ******** */
+  /* Recovery */
+  /* ******** */
+
+  /**
+   * @brief Callback for the Recovery function.
+   */
+  void recovery();
+
+  /** 
+   * @brief Callback for the Heartbeat function.
+   */
+  void heartbeat();
+
+  bool soft_reset_ = false;               // Flag to indicate if a soft reset is needed (deactivation only)
+  bool hard_reset_ = false;               // Flag to indicate if a hard reset is needed (deactivation + cleanup)
+  bool reset_fail_ = false;               // Flag to indicate if both reset failed
+  int recovery_cycle_time_ = 1;           // Recovery cycle time in seconds
+
+  // Watchdog
+  std::shared_ptr<Watchdog> watchdog_;    // Watchdog 
+  int watchdog_timeout_ = 1000;           // Watchdog timeout in milliseconds
+  int watchdog_cycle_time_ = 500;         // Watchdog cycle time in milliseconds
+
+  /* ********* */
+  /* Debugging */
+  /* ********* */
+  
+  int debug_ = 1; // Debugging level (0: no debug, 1: info, 2: debug)
 };
 
 }  // namespace ublox_node

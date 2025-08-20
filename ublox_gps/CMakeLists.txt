@@ -27,6 +27,12 @@ find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(ublox_msgs REQUIRED)
 find_package(ublox_serialization REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
+find_package(std_srvs REQUIRED)
+
+# GPIO
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GPIOD REQUIRED IMPORTED_TARGET libgpiodcxx)
 
 # build node
 add_library(ublox_gps
@@ -46,11 +52,16 @@ add_library(ublox_gps
   src/ublox_firmware7.cpp
   src/ublox_firmware8.cpp
   src/ublox_firmware9.cpp)
+
 target_include_directories(ublox_gps PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
   "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>"
   ${diagnostic_updater_INCLUDE_DIRS}
+  ${rclcpp_lifecycle_INCLUDE_DIRS}
+  ${std_srvs_INCLUDE_DIRS}
+  $<TARGET_PROPERTY:PkgConfig::GPIOD,INTERFACE_INCLUDE_DIRECTORIES>
 )
+
 target_link_libraries(ublox_gps PUBLIC
   ${asio_LIBRARIES}
   ${diagnostic_updater_LIBRARIES}
@@ -66,6 +77,9 @@ target_link_libraries(ublox_gps PUBLIC
   tf2::tf2
   ${ublox_msgs_TARGETS}
   ublox_serialization::ublox_serialization
+  ${rclcpp_lifecycle_LIBRARIES}
+  ${std_srvs_LIBRARIES}
+  PkgConfig::GPIOD
 )
 
 install(TARGETS ublox_gps EXPORT export_${PROJECT_NAME}
