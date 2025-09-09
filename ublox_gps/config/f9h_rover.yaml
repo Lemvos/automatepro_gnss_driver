@@ -13,6 +13,21 @@ ublox_gps_rover_node:
                                 # Device should be configured with u-center and configurations should be saved in flash
                                 # Please use the configuration file provided by Lemvos
     
+    # GPIO configuration
+    gpio:
+      chipname: "gpiochip0"
+      line_num: 134
+      reset_time: 1
+    
+    # Recovery configuration
+    recovery:
+      cycle_time: 1
+    
+    # Watchdog configuration
+    watchdog:
+      timeout: 3000
+      cycle_time: 500
+
     # Enable u-blox message publishers
     publish:
       all: false
