@@ -495,6 +495,18 @@ void UbloxNode::getRosParams() {
 
   this->declare_parameter("diagnostic_period", kDiagnosticPeriod);
 
+  // GPIO parameters
+  chipname_ = this->declare_parameter("gpio.chipname", std::string("gpiochip0"));
+  line_num_ = this->declare_parameter("gpio.line_num", 134);
+  gpio_reset_time_ = this->declare_parameter("gpio.reset_time", 1);
+  
+  // Recovery parameters
+  recovery_cycle_time_ = this->declare_parameter("recovery.cycle_time", 1);
+
+  // Watchdog parameters
+  watchdog_timeout_ = this->declare_parameter("watchdog.timeout", 1000);
+  watchdog_cycle_time_ = this->declare_parameter("watchdog.cycle_time", 500);
+
   // Create publishers based on parameters
   if (getRosBoolean(this, "publish.nav.status")) {
     nav_status_pub_ = this->create_publisher<ublox_msgs::msg::NavSTATUS>("navstatus", 1);
@@ -1038,27 +1050,27 @@ UbloxNode::on_deactivate(const rclcpp_lifecycle::State & state)
 {
     try 
     {
-        // Print the lifecycle state transition
-        RCLCPP_INFO(get_logger(), "Lifecycle state transition: %s (%i) -> %s (%i)", 
-            state.label().c_str(), 
-            state.id(),
-            this->get_current_state().label().c_str(),
-            this->get_current_state().id()
-        ); 
+      // Print the lifecycle state transition
+      RCLCPP_INFO(get_logger(), "Lifecycle state transition: %s (%i) -> %s (%i)", 
+          state.label().c_str(), 
+          state.id(),
+          this->get_current_state().label().c_str(),
+          this->get_current_state().id()
+      ); 
 
-        if (keep_alive_)
-          if (!keep_alive_->is_canceled()) 
-            keep_alive_->cancel();
-        
-        if (poller_)
-          if (!poller_->is_canceled()) 
-            poller_->cancel();
+      if (keep_alive_)
+        if (!keep_alive_->is_canceled()) 
+          keep_alive_->cancel();
       
-        // Stop the watchdog
-        watchdog_->stop();
+      if (poller_)
+        if (!poller_->is_canceled()) 
+          poller_->cancel();
+    
+      // Stop the watchdog
+      watchdog_->stop();
 
-		// Destroy subscriber
-		fix_subscriber_.reset();
+      // Destroy subscriber
+      fix_subscriber_.reset();
     }
     catch (const std::exception &e)
     {
