@@ -497,15 +497,21 @@ void UbloxNode::getRosParams() {
 
   // GPIO parameters
   chipname_ = this->declare_parameter("gpio.chipname", std::string("gpiochip0"));
+  this->get_parameter("gpio.chipname", chipname_);
   line_num_ = this->declare_parameter("gpio.line_num", 134);
+  this->get_parameter("gpio.line_num", line_num_);
   gpio_reset_time_ = this->declare_parameter("gpio.reset_time", 1);
+  this->get_parameter("gpio.reset_time", gpio_reset_time_);
   
   // Recovery parameters
   recovery_cycle_time_ = this->declare_parameter("recovery.cycle_time", 1);
+  this->get_parameter("recovery.cycle_time", recovery_cycle_time_);
 
   // Watchdog parameters
   watchdog_timeout_ = this->declare_parameter("watchdog.timeout", 1000);
+  this->get_parameter("watchdog.timeout", watchdog_timeout_);
   watchdog_cycle_time_ = this->declare_parameter("watchdog.cycle_time", 500);
+  this->get_parameter("watchdog.cycle_time", watchdog_cycle_time_);
 
   // Create publishers based on parameters
   if (getRosBoolean(this, "publish.nav.status")) {

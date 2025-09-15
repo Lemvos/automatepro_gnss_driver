@@ -398,7 +398,7 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
   gpiod::chip chip_;                    // GPIO chip
   gpiod::line line_;                    // GPIO line
   std::string chipname_;                // GPIO chipname
-  unsigned int line_num_;               // GPIO line number
+  int line_num_;                        // GPIO line number
   int gpio_reset_time_;                 // GPIO reset time in seconds
   
   /* ******** */
