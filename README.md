@@ -1,4 +1,6 @@
 # ublox
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FLemvos%2Fautomatepro_gnss_driver.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FLemvos%2Fautomatepro_gnss_driver?ref=badge_shield)
+
 The `ublox` package provides support for [u-blox](http://www.u-blox.com) GPS receivers. Only the _serial_ configuration of the driver is documented here, but TCP/UDP communication is also supported by the driver (untested).
 
 The driver was originally written by Johannes Meyer. Changes made later are detailed in the version history below.
@@ -390,3 +392,7 @@ The recovery process is state-aware and escalates through several steps:
 3. **GPIO Reset and Wait**: If both soft and hard resets have been attempted, the system toggles the GPIO line to reset the hardware, waits for a configurable period, and retries recovery.
 
 After each recovery attempt, the node checks its state and, if not active, continues retrying with GPIO resets and delays until successful. 
+
+
+## License
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FLemvos%2Fautomatepro_gnss_driver.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2FLemvos%2Fautomatepro_gnss_driver?ref=badge_large)
