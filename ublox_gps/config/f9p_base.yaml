@@ -1,7 +1,7 @@
 # Configuration Settings for C94-M8P device
 ublox_gps_base_node:
   ros__parameters:
-    debug: 3                    # Range 0-4 (0 means no debug statements will print)
+    debug: 0                    # Range 0-4 (0 means no debug statements will print)
 
     device: /dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver_F9P-if00
     frame_id: gps_base

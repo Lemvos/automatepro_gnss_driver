@@ -1,72 +1,114 @@
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstdlib>
+#include <exception>
 #include <memory>
+#include <thread>
 
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_lifecycle/lifecycle_node.hpp>
+#include <lifecycle_msgs/msg/state.hpp>
 
 #include <ublox_gps/node.hpp>
 
-// Declare the node globally to use in signal handler
-std::shared_ptr<ublox_node::UbloxNode> node;
+using namespace std::chrono_literals;
+using lifecycle_msgs::msg::State;
 
-void signal_handler(int signal)
-{
-    RCLCPP_INFO(node->get_logger(), "SIGINT (%i) received, triggering shutdown.", signal);
-
-    // Trigger the shutdown method of the UbloxNode
-    auto current_state = node->get_current_state().id();
-    if (rclcpp::ok() && current_state != lifecycle_msgs::msg::State::PRIMARY_STATE_FINALIZED) 
-    {
-        if (current_state == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
-            node->trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_DEACTIVATE); 
-            current_state = node->get_current_state().id();
-        }
-
-        if (current_state == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
-            node->trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_CLEANUP);
-            current_state = node->get_current_state().id();
-        }
-
-        if (current_state == lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED) {
-            auto transitions = node->get_available_transitions();
-            for (const rclcpp_lifecycle::Transition & t : transitions) {
-                if (t.id() == lifecycle_msgs::msg::Transition::TRANSITION_UNCONFIGURED_SHUTDOWN) {
-                    node->trigger_transition(rclcpp_lifecycle::Transition(t.id()));  // shutdown
-                    break;
-                }
-            }
-        }
-    }
-
-    // Shutdown the ROS 2 node
-    RCLCPP_INFO(node->get_logger(), "Shutting down UbloxNode...");
-    rclcpp::shutdown();
+namespace {
+  // Set in the signal handler, read in the watcher thread.
+  static_assert(std::atomic<bool>::is_always_lock_free);
+  std::atomic<bool> g_stop{false};
+  void on_signal(int) {
+    // First signal: request graceful stop. Second: force quit.
+    if (g_stop.exchange(true, std::memory_order_relaxed))
+      std::_Exit(1);
+  }
 }
 
-int main(int argc, char** argv) {
-  // Force flush of the stdout buffer.
-  setvbuf(stdout, nullptr, _IONBF, BUFSIZ);
+int main(int argc, char ** argv)
+{
+  // Drive the lifecycle ourselves; rclcpp's own signal handlers are disabled.
+  rclcpp::init(argc, argv, rclcpp::InitOptions(),
+               rclcpp::SignalHandlerOptions::None);
+  std::signal(SIGINT,  on_signal);
+  std::signal(SIGTERM, on_signal);
 
-  rclcpp::init(argc, argv);
+  rclcpp::executors::SingleThreadedExecutor exec;
+  std::shared_ptr<ublox_node::UbloxNode> node;
 
-  // Create the UbloxNode instance
-  node = std::make_shared<ublox_node::UbloxNode>(rclcpp::NodeOptions());
-  
-  // Register the signal handler for SIGINT
-  std::signal(SIGINT, signal_handler);
+  // Bring-up: construction and each transition are checked, not assumed.
+  // Node is destroyed before rclcpp::shutdown() on every exit path.
+  try {
+    node = std::make_shared<ublox_node::UbloxNode>(rclcpp::NodeOptions());
+    exec.add_node(node->get_node_base_interface());
 
-  // Spin the node to process callbacks
-  rclcpp::executors::SingleThreadedExecutor executor;
-  executor.add_node(node->get_node_base_interface());
-	
-	// Initialize UBlox 
-	node->trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_CONFIGURE);
+    if (node->configure().id() != State::PRIMARY_STATE_INACTIVE) {
+      RCLCPP_FATAL(node->get_logger(), "configure failed");
+      node.reset();
+      rclcpp::shutdown();
+      return 1;
+    }
+    // Don't activate if a stop was already requested during bring-up.
+    if (!g_stop.load(std::memory_order_relaxed)) {
+      if (node->activate().id() != State::PRIMARY_STATE_ACTIVE) {
+        RCLCPP_FATAL(node->get_logger(), "activate failed");
+        node->cleanup();
+        node.reset();
+        rclcpp::shutdown();
+        return 1;
+      }
+    } else {
+      RCLCPP_WARN(node->get_logger(), "stop requested during bring-up; not activating");
+    }
+  } catch (const std::exception & e) {
+    RCLCPP_FATAL(rclcpp::get_logger("ublox_gps_node"), "bring-up failed: %s", e.what());
+    node.reset();
+    rclcpp::shutdown();
+    return 1;
+  }
 
-	// Activate UBlox and start Watchdog
-	node->trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_ACTIVATE);
+  // Run until a stop is requested; the watcher cancels the spin.
+  if (node->get_current_state().id() == State::PRIMARY_STATE_ACTIVE
+      && !g_stop.load(std::memory_order_relaxed)) {
+    RCLCPP_INFO(node->get_logger(), "Node running.");
+    std::thread watcher([&exec]() {
+      while (rclcpp::ok() && !g_stop.load(std::memory_order_relaxed))
+        std::this_thread::sleep_for(100ms);
+      while (rclcpp::ok() && !exec.is_spinning())
+        std::this_thread::sleep_for(5ms);               // avoid cancel-before-spin race
+      exec.cancel();
+    });
+    exec.spin();
+    watcher.join();
+  }
 
-  executor.spin();
+  // Teardown ladder; each step is checked so a failed fail-safe is logged.
+  auto id = [&]{ return node->get_current_state().id(); };
+  if (rclcpp::ok() && id() != State::PRIMARY_STATE_FINALIZED
+                   && id() != State::PRIMARY_STATE_UNKNOWN)
+  {
+    if (id() == State::PRIMARY_STATE_ACTIVE) {
+      if (node->deactivate().id() != State::PRIMARY_STATE_INACTIVE)
+        RCLCPP_ERROR(node->get_logger(), "deactivate failed: fail-safe did NOT run");
+    }
+    if (id() == State::PRIMARY_STATE_INACTIVE) {
+      if (node->cleanup().id() != State::PRIMARY_STATE_UNCONFIGURED)
+        RCLCPP_ERROR(node->get_logger(), "cleanup failed: resources may be leaked");
+    }
+    if (id() != State::PRIMARY_STATE_FINALIZED &&
+        id() != State::PRIMARY_STATE_UNKNOWN) {
+      // LifecycleNode::shutdown() is qualified: UbloxNode::shutdown() hides it.
+      if (node->rclcpp_lifecycle::LifecycleNode::shutdown().id() != State::PRIMARY_STATE_FINALIZED)
+        RCLCPP_ERROR(node->get_logger(), "shutdown did not reach finalized");
+    }
+  }
+  else {
+    RCLCPP_ERROR(node->get_logger(),
+      "teardown skipped: context down or node not in a teardownable state");
+  }
 
-  //rclcpp::shutdown();
-  RCLCPP_INFO(node->get_logger(), "UbloxNode has been shut down gracefully.");
-
+  node.reset();
+  rclcpp::shutdown();
   return 0;
 }

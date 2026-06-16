@@ -65,6 +65,7 @@
 // Debugging: service to enable/disable gps inputs
 #include <std_srvs/srv/set_bool.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 
 // This file also declares UbloxNode which is the main class and ros node. It
 // implements functionality which applies to any u-blox device, regardless of
@@ -114,6 +115,9 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
   const double kFixFreqWindow = 10;
   //! Minimum Time Stamp Status for fix frequency diagnostic
   const double kTimeStampStatusMin = 0;
+  //! Orientation covariance the producer leaves when the heading is invalid
+  //! (hp_pos_rec_product.cpp); values >= this mean "no valid heading".
+  constexpr static double kInvalidHeadingCovariance = 1000.0;
 
   /**
    * @brief Initialize and run the u-blox node.
@@ -176,10 +180,11 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
   void initialize();
 
   /**
-   * @brief Shutdown the node. Closes the serial port.
+   * @brief Close the serial port. Hides LifecycleNode::shutdown() (the
+   * transition); qualify the base name to trigger the transition.
    */
   void shutdown();
-  void shutdown2();
+  
   /**
    * @brief Send a reset message the u-blox device & re-initialize the I/O.
    * @return true if reset was successful, false otherwise.
@@ -359,10 +364,25 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
    * @param msg The NavSatFix message.
    */
   void fixCallback(const sensor_msgs::msg::NavSatFix::SharedPtr msg);
-  
+
   // Subscriber for node /ublox_gps_rover_node/fix of type sensor_msgs/msg/NavSatFix
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr fix_subscriber_;
-  
+
+  /**
+   * @brief Callback for the heading (Imu) message; surfaces heading loss.
+   * @param msg The Imu heading message.
+   */
+  void headingCallback(const sensor_msgs::msg::Imu::SharedPtr msg);
+
+  // Subscriber for the node's own navheading topic (heading nodes only)
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr heading_subscriber_;
+
+  // Whether this node produces (and therefore monitors) a heading solution
+  bool monitor_heading_ = false;
+
+  // Arrival time of the last valid heading; used by the freshness guard.
+  std::chrono::steady_clock::time_point last_heading_time_;
+
   /* **** */
   /* GPIO */
   /* **** */
@@ -379,24 +399,12 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
   void close_gpio_chipname();
 
   /**
-   * @brief Set the GPIO line number.
-   * @param line_num the GPIO line number
+   * @brief Pulse the GPIO reset line (LOW for gpio_reset_time_ s, then HIGH).
+   * The line is requested only for the pulse and released immediately.
    */
-  void open_gpio_line(unsigned int line);
+  void reset_gpio_line();
 
-  /**
-   * @brief Close the GPIO line.
-   */
-  void close_gpio_line();
-  
-  /**
-   * @brief GPIO set HIGH or LOW.
-   * @return True is success, False otherwise.
-   */
-  void set_gpio_toggle(bool high);
-  
   gpiod::chip chip_;                    // GPIO chip
-  gpiod::line line_;                    // GPIO line
   std::string chipname_;                // GPIO chipname
   unsigned int line_num_;               // GPIO line number
   int gpio_reset_time_;                 // GPIO reset time in seconds
@@ -419,6 +427,11 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
   bool hard_reset_ = false;               // Flag to indicate if a hard reset is needed (deactivation + cleanup)
   bool reset_fail_ = false;               // Flag to indicate if both reset failed
   int recovery_cycle_time_;               // Recovery cycle time in seconds
+
+  // Recovery is requested on the watchdog thread and run on the executor via
+  // recovery_timer_ (see docs/error-handling-and-recovery.md).
+  std::atomic<bool> recovery_requested_{false};
+  rclcpp::TimerBase::SharedPtr recovery_timer_;
 
   // Watchdog
   std::shared_ptr<Watchdog> watchdog_;    // Watchdog 

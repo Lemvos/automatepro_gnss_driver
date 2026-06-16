@@ -19,7 +19,7 @@ public:
     {
         watchdog_thread_ = std::thread([this]() {
             while (enable_watchdog_) {
-                std::this_thread::sleep_for(check_interval_);
+                std::this_thread::sleep_for(check_interval_.load());
 
                 if (!run_watchdog_) continue; 
 
@@ -34,7 +34,7 @@ public:
                 std::function<void()> current_callback;
                 {
                     std::lock_guard<std::mutex> lock(callback_mutex_);
-                    if ((now - last_reset_cp) >= timeout_) {
+                    if ((now - last_reset_cp) >= timeout_.load()) {
                         current_callback = callback_;
                     }
                     else {
@@ -67,9 +67,12 @@ public:
     }
 
     void start() {
-        last_reset_ = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(reset_mutex_);
+            last_reset_ = std::chrono::steady_clock::now();
+        }
         this->run_watchdog_ = true;
-        std::cout << "[Watchdog] Started with timeout: " << this->timeout_.count() << " ms" << std::endl;
+        std::cout << "[Watchdog] Started with timeout: " << this->timeout_.load().count() << " ms" << std::endl;
     }
 
     void set_timeout(std::chrono::milliseconds timeout){
@@ -97,8 +100,9 @@ public:
     }
     
 private:
-    std::chrono::milliseconds timeout_;
-    std::chrono::milliseconds check_interval_;
+    // Atomic: written from the node thread, read on the watchdog thread.
+    std::atomic<std::chrono::milliseconds> timeout_;
+    std::atomic<std::chrono::milliseconds> check_interval_;
     std::function<void()> callback_;
     std::atomic<bool> enable_watchdog_;
     std::atomic<bool> run_watchdog_;

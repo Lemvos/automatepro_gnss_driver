@@ -356,6 +356,15 @@ Currently there are implementations of `ComponentInterface` for firmware version
 
 `UbloxFirmware7` has not been properly tested on a device with firmware version 7. `UbloxFirmware6` has been tested on a device with firmware version 8, but not with firmware version 6.
 
+## GNSS integrity limitations (recovery scope)
+
+These are known, intentional limitations of the watchdog/recovery system. Consumers that depend on GNSS integrity (navigation, unattended operation) must account for them at a higher level — they are **not** handled by the driver's automatic recovery.
+
+- **RTK / carrier-solution quality is not part of recovery.** The watchdog and recovery only act on **communication loss** (no messages from the receiver). RTK degradation (fixed → float → none) and loss of RTCM correction input are **not** monitored for recovery and will **not** trigger a reset. RTK state is surfaced only via (a) `NavSatFix.status` on `~/fix` (`STATUS_GBAS_FIX` only when carrier-phase *fixed*; float and single map to `STATUS_FIX`), (b) the *Carrier Phase Solution* `/diagnostics` task, and (c) the `rxmrtcm` rate diagnostic. A consumer that requires cm-level RTK must gate on `NavSatFix.status` / `/diagnostics`. RTCM correction freshness is not timed out.
+- **Recovery is gated on comms loss, not fix loss.** A receiver that keeps streaming but never gets a valid fix (e.g. antenna fault, sustained obstruction) keeps the comms watchdog satisfied and is **not** reset. This is deliberate: the watchdog timeout (seconds) is far shorter than GNSS re-acquisition time, so resetting on no-fix would loop and *prevent* a fix. Loss of a valid fix is surfaced via `NavSatFix.status` (`STATUS_NO_FIX`), the fix `/diagnostics` task, and a throttled node log; downstream/safety logic must act on those.
+- **Heading quality is surfaced, not recovered.** Loss of a valid moving-baseline heading is reported via the heading `Imu` `orientation_covariance` (large/`1000` when invalid) and a throttled node log, but does not trigger recovery (same re-acquisition reasoning, and a reset cannot restore corrections). A heading stream that *stops* while the position stream is still alive (the heading consumer would otherwise hold a stale last-known heading) is also surfaced via a throttled node log: heading freshness is checked on each `~/fix` message against the comms-freshness window (`watchdog.timeout`).
+- **Message timestamps reflect publish time, not fix validity.** `header.stamp` on `~/fix`/`navheading` is set to the receiver time when valid and otherwise to the current ROS time, and is stamped on every message regardless of fix validity. A "recent" timestamp therefore does **not** by itself imply a valid or fresh fix — consumers must check `NavSatFix.status` / heading covariance for validity, not only the timestamp. There is no detection of a frozen/repeated solution.
+
 ## Debugging
 
 For debugging messages set the debug parameter to > 0. The range for debug is 0-4. At level 1 it prints configuration messages and checksum errors, at level 2 it also prints ACK/NACK messages and sent messages. At level 3 it prints the received bytes being decoded by a specific message reader. At level 4 it prints the incoming buffer before it is split by message header.
@@ -382,11 +391,13 @@ This design ensures that the node can be safely reconfigured, restarted, or shut
 
 # Recovery System Overview
 
-The node implements an integrated recovery system to handle communication failures or hardware issues. A watchdog timer monitors data reception from the GNSS device. If no data is received within the configured timeout, the watchdog triggers the recovery logic.
+The node implements an integrated recovery system to handle communication failures or hardware issues. A watchdog timer monitors **data reception** from the GNSS device (it is reset on every `~/fix` message). If no message is received within the configured timeout, the watchdog requests recovery. Recovery targets **communication loss**, not loss of fix/RTK quality — see *GNSS integrity limitations* above.
+
+The watchdog runs on its own thread but only *requests* recovery (an atomic flag); recovery itself runs on the node's executor (via a short-period timer) so that lifecycle transitions and the teardown of the GPS/diagnostic objects never race the executor's own callbacks.
 
 The recovery process is state-aware and escalates through several steps:
-1. **Soft Reset**: If the node is active and no prior reset has occurred, a soft reset is performed by deactivating and reactivating the node.
-2. **Hard Reset**: If a soft reset has already been performed, a hard reset is executed by deactivating and cleaning up the node, then reconfiguring and activating it.
-3. **GPIO Reset and Wait**: If both soft and hard resets have been attempted, the system toggles the GPIO line to reset the hardware, waits for a configurable period, and retries recovery.
+1. **Soft Reset**: If the node is active and no prior reset has occurred, the receiver is reset with a u-blox **UBX-CFG-RST controlled software reset** (hot start — battery-backed data is kept for fast re-acquisition), and the node is deactivated/reactivated.
+2. **Hard Reset**: If a soft reset has already been performed, a hard reset is executed by deactivating and cleaning up the node, then reconfiguring and activating it (this reopens the serial connection).
+3. **GPIO Reset and Wait**: If both soft and hard resets have been attempted, the system pulses the GPIO line to reset the hardware, waits for a configurable period, and retries recovery.
 
-After each recovery attempt, the node checks its state and, if not active, continues retrying with GPIO resets and delays until successful. 
+After each recovery attempt the node checks its state and, if not active, re-arms the recovery request and retries (with GPIO resets and delays) until successful. Retries are **iterative**, not recursive, so a prolonged outage cannot grow the call stack.
