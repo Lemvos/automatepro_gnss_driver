@@ -1,3 +1,16 @@
+// Standalone entry point for the u-blox lifecycle node.
+//
+// The node owns its lifecycle: rclcpp's signal handlers are disabled and this
+// process installs its own SIGINT/SIGTERM handlers. A signal only sets an
+// async-signal-safe stop flag; a watcher thread breaks executor.spin() with
+// cancel(), keeping the ROS context valid so the single finalize() teardown
+// ladder (deactivate -> cleanup -> shutdown) can run cleanly before
+// rclcpp::shutdown().
+//
+// Structure follows automatepro_ws_template/src/main_lifecycle.cpp; keep the
+// two in step. The only deliberate divergence is the qualified call to
+// LifecycleNode::shutdown() in finalize(), which UbloxNode::shutdown() hides.
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -6,103 +19,185 @@
 #include <memory>
 #include <thread>
 
+#include <lifecycle_msgs/msg/state.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
-#include <lifecycle_msgs/msg/state.hpp>
 
 #include <ublox_gps/node.hpp>
 
-using namespace std::chrono_literals;
-using lifecycle_msgs::msg::State;
+namespace
+{
 
-namespace {
-  // Set in the signal handler, read in the watcher thread.
-  static_assert(std::atomic<bool>::is_always_lock_free);
-  std::atomic<bool> g_stop{false};
-  // Async-signal-safe: only an atomic store and (on a second signal) _Exit.
-  void on_signal(int) {
-    // First signal: request graceful stop. Second: force quit.
-    if (g_stop.exchange(true, std::memory_order_relaxed))
-      std::_Exit(1);
+// Set by the signal handler, polled by main() and the watcher thread. Must be
+// lock-free to be safe to touch from a signal handler.
+std::atomic<bool> g_stop_requested{false};
+static_assert(
+  std::atomic<bool>::is_always_lock_free,
+  "std::atomic<bool> must be lock-free to be async-signal-safe");
+
+// How often the watcher thread polls the stop flag while spinning.
+constexpr std::chrono::milliseconds kStopPollInterval{100};
+// Short back-off while waiting for the executor to start spinning.
+constexpr std::chrono::milliseconds kSpinStartPollInterval{1};
+
+// Async-signal-safe: the first signal requests a graceful stop; a second forces
+// an immediate exit. No logging, allocation, or library calls here.
+void handle_stop_signal([[maybe_unused]] int signum)
+{
+  if (g_stop_requested.exchange(true)) {
+    std::_Exit(EXIT_FAILURE);
   }
 }
 
-int main(int argc, char ** argv)
+// Single checked teardown ladder run on every post-construction exit path.
+// noexcept because the lifecycle convenience methods carry no no-throw contract
+// and this must never propagate out of main().
+void finalize(const std::shared_ptr<ublox_node::UbloxNode> & node) noexcept
 {
-  // Drive the lifecycle ourselves; rclcpp's own signal handlers are disabled.
-  rclcpp::init(argc, argv, rclcpp::InitOptions(),
-               rclcpp::SignalHandlerOptions::None);
-  std::signal(SIGINT,  on_signal);
-  std::signal(SIGTERM, on_signal);
-
-  rclcpp::executors::SingleThreadedExecutor exec;
-  std::shared_ptr<ublox_node::UbloxNode> node;
-
-  // One checked teardown ladder, run on EVERY post-construction exit (bring-up
-  // failure, exception, or normal stop) so on_cleanup/on_shutdown always run and
-  // every result is checked. No divergent ad-hoc teardown. Safe to call from any
-  // post-construction state; only ever invoked once node is non-null.
-  auto finalize = [&] {
-    auto id = [&]{ return node->get_current_state().id(); };
-    if (!rclcpp::ok() || id() == State::PRIMARY_STATE_FINALIZED
-                      || id() == State::PRIMARY_STATE_UNKNOWN) {
-      RCLCPP_ERROR(node->get_logger(),
-        "teardown skipped: context down or node not in a teardownable state");
+  try {
+    if (!node || !rclcpp::ok()) {
       return;
     }
-    if (id() == State::PRIMARY_STATE_ACTIVE
-        && node->deactivate().id() != State::PRIMARY_STATE_INACTIVE)
-      RCLCPP_ERROR(node->get_logger(), "deactivate failed: fail-safe did NOT run");
-    if (id() == State::PRIMARY_STATE_INACTIVE
-        && node->cleanup().id() != State::PRIMARY_STATE_UNCONFIGURED)
-      RCLCPP_ERROR(node->get_logger(), "cleanup failed: resources may be leaked");
-    // LifecycleNode::shutdown() is qualified: UbloxNode::shutdown() hides it.
-    if (id() != State::PRIMARY_STATE_FINALIZED && id() != State::PRIMARY_STATE_UNKNOWN
-        && node->rclcpp_lifecycle::LifecycleNode::shutdown().id()
-             != State::PRIMARY_STATE_FINALIZED)
-      RCLCPP_ERROR(node->get_logger(), "shutdown did not reach finalized");
-  };
 
-  // Bring-up: construction and each transition are checked, not assumed.
-  // Node is destroyed before rclcpp::shutdown() on every exit path.
-  try {
-    node = std::make_shared<ublox_node::UbloxNode>(rclcpp::NodeOptions());
-    exec.add_node(node->get_node_base_interface());
+    auto state_id = node->get_current_state().id();
 
-    if (node->configure().id() != State::PRIMARY_STATE_INACTIVE) {
-      RCLCPP_FATAL(node->get_logger(), "configure failed");
-      finalize(); node.reset(); rclcpp::shutdown(); return 1;
+    if (state_id == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+      RCLCPP_INFO(rclcpp::get_logger("main"), "Deactivating node...");
+      state_id = node->deactivate().id();
     }
-    // Don't activate if a stop was already requested during bring-up.
-    if (g_stop.load(std::memory_order_relaxed)) {
-      RCLCPP_WARN(node->get_logger(), "stop requested during bring-up; not activating");
-    } else if (node->activate().id() != State::PRIMARY_STATE_ACTIVE) {
-      RCLCPP_FATAL(node->get_logger(), "activate failed");
-      finalize(); node.reset(); rclcpp::shutdown(); return 1;
+
+    if (state_id == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
+      RCLCPP_INFO(rclcpp::get_logger("main"), "Cleaning up node...");
+      state_id = node->cleanup().id();
+      // Cleanup error-processes into FINALIZED instead of UNCONFIGURED on failure.
+      if (state_id == lifecycle_msgs::msg::State::PRIMARY_STATE_FINALIZED) {
+        RCLCPP_ERROR(rclcpp::get_logger("main"), "Cleanup failed; node finalized via error.");
+      }
+    }
+
+    // shutdown() is valid from ACTIVE, INACTIVE, or UNCONFIGURED, so run it from
+    // any non-finalized state -- including when on_deactivate returned FAILURE and
+    // left the node ACTIVE -- to guarantee on_shutdown runs before destruction.
+    if (state_id == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE ||
+      state_id == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE ||
+      state_id == lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED)
+    {
+      RCLCPP_INFO(rclcpp::get_logger("main"), "Shutting down node...");
+      // UbloxNode::shutdown() closes the serial port and hides the inherited
+      // transition, so the base name is qualified here.
+      state_id = node->rclcpp_lifecycle::LifecycleNode::shutdown().id();
+    }
+
+    if (state_id != lifecycle_msgs::msg::State::PRIMARY_STATE_FINALIZED) {
+      RCLCPP_ERROR(
+        rclcpp::get_logger("main"), "Teardown ended in state %d instead of finalized.", state_id);
     }
   } catch (const std::exception & e) {
-    RCLCPP_FATAL(rclcpp::get_logger("ublox_gps_node"), "bring-up failed: %s", e.what());
-    if (node) finalize();                     // fail-safe still runs
-    node.reset(); rclcpp::shutdown(); return 1;
+    RCLCPP_ERROR(rclcpp::get_logger("main"), "Exception during teardown: %s", e.what());
+  } catch (...) {
+    RCLCPP_ERROR(rclcpp::get_logger("main"), "Unknown exception during teardown.");
+  }
+}
+
+// RAII guard that always requests a stop and joins the watcher thread on scope
+// exit, including exception unwinding out of spin(). Both flags must be set
+// before join(): the stop flag releases the watcher's first wait, and the
+// spin-finished flag releases its cancel-before-spin guard, which would
+// otherwise wait forever for a spin that has already unwound. Joining before
+// std::thread's destructor runs avoids std::terminate() on a joinable thread.
+struct WatcherGuard
+{
+  std::thread & watcher;
+  std::atomic<bool> & spin_finished;
+
+  ~WatcherGuard() noexcept
+  {
+    spin_finished.store(true);
+    g_stop_requested.store(true);
+    if (watcher.joinable()) {
+      watcher.join();
+    }
+  }
+};
+
+}  // namespace
+
+int main(int argc, char * argv[])
+{
+  // Own the lifecycle: disable rclcpp's signal handlers and install our own so
+  // termination runs the teardown ladder below instead of rclcpp's default
+  // context shutdown.
+  rclcpp::init(argc, argv, rclcpp::InitOptions(), rclcpp::SignalHandlerOptions::None);
+  std::signal(SIGINT, handle_stop_signal);
+  std::signal(SIGTERM, handle_stop_signal);
+
+  std::shared_ptr<ublox_node::UbloxNode> node;
+  int exit_code = EXIT_SUCCESS;
+
+  // Any throw from construction, bring-up, add_node, or spin() must still reach
+  // the single finalize() ladder below, so the whole run is wrapped and the
+  // catch only records the failure.
+  try {
+    node = std::make_shared<ublox_node::UbloxNode>(rclcpp::NodeOptions());
+
+    // Bring-up: configure -> activate, checking the resulting state each step and
+    // honouring a stop that arrives during bring-up.
+    if (g_stop_requested.load()) {
+      RCLCPP_INFO(rclcpp::get_logger("main"), "Stop requested before bring-up. Shutting down...");
+    } else if (node->configure().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
+      RCLCPP_FATAL(rclcpp::get_logger("main"), "Node failed to configure; exiting.");
+      exit_code = EXIT_FAILURE;
+    } else if (g_stop_requested.load()) {
+      RCLCPP_INFO(rclcpp::get_logger("main"), "Stop requested during configure. Shutting down...");
+    } else if (node->activate().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+      RCLCPP_FATAL(rclcpp::get_logger("main"), "Node failed to activate; exiting.");
+      exit_code = EXIT_FAILURE;
+    } else {
+      rclcpp::executors::SingleThreadedExecutor executor;
+      // Lifecycle nodes expose the base interface so the executor services both
+      // regular and lifecycle-related callbacks.
+      executor.add_node(node->get_node_base_interface());
+
+      // Set once spin() has returned, normally or by exception. spin() clears
+      // its spinning flag while unwinding, so without this the watcher's
+      // cancel-before-spin guard below would wait for a spin that never resumes
+      // and the join() in WatcherGuard would never return.
+      std::atomic<bool> spin_finished{false};
+
+      // The signal handler cannot cancel the executor directly (not
+      // async-signal-safe), so a watcher thread breaks spin() on the stop flag.
+      // is_spinning() guards the cancel-before-spin race.
+      std::thread watcher(
+        [&executor, &spin_finished]() {
+          while (rclcpp::ok() && !g_stop_requested.load()) {
+            std::this_thread::sleep_for(kStopPollInterval);
+          }
+          while (rclcpp::ok() && !spin_finished.load() && !executor.is_spinning()) {
+            std::this_thread::sleep_for(kSpinStartPollInterval);
+          }
+          executor.cancel();
+        });
+      // Guarantees the watcher is stopped and joined on every exit from this
+      // scope -- normal return or an exception out of spin().
+      WatcherGuard watcher_guard{watcher, spin_finished};
+
+      RCLCPP_INFO(rclcpp::get_logger("main"), "Node is running.");
+      executor.spin();
+
+      RCLCPP_INFO(rclcpp::get_logger("main"), "Stop received. Shutting down...");
+    }
+  } catch (const std::exception & e) {
+    RCLCPP_FATAL(rclcpp::get_logger("main"), "Exception during bring-up or spin: %s", e.what());
+    exit_code = EXIT_FAILURE;
+  } catch (...) {
+    RCLCPP_FATAL(rclcpp::get_logger("main"), "Unknown exception during bring-up or spin.");
+    exit_code = EXIT_FAILURE;
   }
 
-  // Run until a stop is requested; the watcher cancels the spin.
-  if (node->get_current_state().id() == State::PRIMARY_STATE_ACTIVE
-      && !g_stop.load(std::memory_order_relaxed)) {
-    RCLCPP_INFO(node->get_logger(), "Node running.");
-    std::thread watcher([&exec]() {
-      while (rclcpp::ok() && !g_stop.load(std::memory_order_relaxed))
-        std::this_thread::sleep_for(100ms);
-      while (rclcpp::ok() && !exec.is_spinning())
-        std::this_thread::sleep_for(5ms);               // avoid cancel-before-spin race
-      exec.cancel();
-    });
-    exec.spin();
-    watcher.join();
-  }
-
-  finalize();
+  finalize(node);
   node.reset();
+
+  RCLCPP_INFO(rclcpp::get_logger("main"), "Node has shut down gracefully.");
   rclcpp::shutdown();
-  return 0;
+  return exit_code;
 }
