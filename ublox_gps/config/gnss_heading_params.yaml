@@ -1,0 +1,40 @@
+# Configuration Settings for F9H device in Rover Mode
+automatepro_gnss_heading_node:
+  ros__parameters:
+    debug: 0                    # Range 0-4 (0 means no debug statements will print)
+
+    device: /dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver_F9H-if00
+    frame_id: gnss_heading
+
+    config_on_startup: false    # If false, the node will not override configurations of the device on startup
+                                # Device should be configured with u-center and configurations should be saved in flash
+                                # Please use the configuration file provided by Lemvos
+
+    # GPIO configuration (shared hardware reset line; pulsed only during recovery)
+    gpio:
+      chipname: "gpiochip0"
+      line_num: 134
+      reset_time: 1
+
+    # Recovery configuration
+    recovery:
+      cycle_time: 1
+
+    # Comms-liveness watchdog (a wall timer on the node executor; fires recovery
+    # when no ~/fix arrives within 'timeout', checked every 'cycle_time').
+    watchdog:
+      timeout: 3000
+      cycle_time: 500
+
+    # Enable u-blox gnss message publishers
+    publish:
+      all: false
+      aid:
+        hui: false
+      nav:
+        relposned: true         # NAV-RELPOSNED (moving-baseline relative position + heading)
+        heading: true           # Publish heading as Imu on ~/navheading AND enable
+                                # heading integrity monitoring (covariance + freshness)
+      nmea: false
+      mon:
+        all: true
