@@ -420,22 +420,40 @@ Consult the [official protocol spec](https://www.u-blox.com/sites/default/files/
 The `UbloxNode` class is implemented as a ROS 2 Lifecycle Node, providing robust state management and controlled transitions for the GNSS driver. The lifecycle logic is structured around the standard ROS 2 lifecycle states: unconfigured, inactive, active, and finalized. Key lifecycle transitions (`on_configure`, `on_activate`, `on_deactivate`, `on_cleanup`, and `on_shutdown`) are overridden to manage resource allocation, initialization, activation, and cleanup of the GNSS device and related subsystems.
 
 - **on_configure**: Initializes the GNSS device, diagnostic updater, GNSS and GPS interfaces, and sets up GPIO resources. 
-- **on_activate**: Starts periodic timers for polling and keep-alive, activates the watchdog, and subscribes to the NavSatFix topic for fix updates.
-- **on_deactivate**: Stops timers, disables the watchdog, and cleans up subscriptions.
+- **on_activate**: Starts periodic timers for polling and keep-alive, subscribes to `~/fix`, and **arms** the comms-liveness watchdog (seeds the freshness clock, sets `monitoring_enabled_`).
+- **on_deactivate**: Stops timers, **disarms** the watchdog (the timer keeps running but stops checking), and cleans up subscriptions.
 - **on_cleanup**: Releases all resources, including timers, publishers, GNSS/GPS objects, and GPIO lines.
-- **on_shutdown**: Ensures all resources are closed and the watchdog is stopped.
+- **on_shutdown**: Disarms the watchdog and ensures all resources are closed.
 
 This design ensures that the node can be safely reconfigured, restarted, or shut down, with all hardware and software resources managed according to the node's state.
+
+## Bring-up and shutdown (`node_main.cpp`)
+
+- **Signal handling is async-signal-safe.** `rclcpp` signal handlers are disabled (`SignalHandlerOptions::None`) so `main` drives teardown and the context stays valid. The handler only does `g_stop.exchange(true)`; the first signal requests a graceful stop, a second forces `std::_Exit(1)` as an escape hatch if teardown hangs. A watcher thread observes `g_stop` and cancels the spin, waiting for `is_spinning()` first to avoid a cancel-before-spin race.
+- **Transitions are checked, not assumed.** Bring-up verifies `configure() → INACTIVE` and `activate() → ACTIVE`; a stop requested during bring-up skips `activate()`. The teardown ladder (`deactivate` → `cleanup` → `shutdown`) checks each resulting state and logs when a fail-safe step did not run. The node is destroyed before `rclcpp::shutdown()` on every exit path.
+- **`shutdown()` name collision.** `UbloxNode::shutdown()` (closes the serial port; called from `on_shutdown()` and the destructor) hides the inherited `LifecycleNode::shutdown()` transition. Callers that want the *transition* must qualify it: `node->rclcpp_lifecycle::LifecycleNode::shutdown()`.
+- **Fail-safe teardown without a device.** `UbloxNode::shutdown()` guards `gps_` (created only in `on_configure()`), so tearing down a node that never configured — for example because configure failed on a missing device — does not null-deref.
 
 # Recovery System Overview
 
 The node implements an integrated recovery system to handle communication failures or hardware issues. A watchdog monitors **data reception** from the GNSS device (the arrival time of the last `~/fix` is recorded on every message). If no message is received within the configured timeout, recovery is triggered. Recovery targets **communication loss**, not loss of fix/RTK quality — see *GNSS integrity limitations* above.
 
-The watchdog is a single wall timer on the node's executor (it replaced an earlier dedicated watchdog thread). Each tick — every `watchdog.cycle_time` ms — compares the time since the last `~/fix` against `watchdog.timeout` and, on comms loss, runs recovery **inline on the executor**, so lifecycle transitions and the teardown of the GPS/diagnostic objects never race the executor's own callbacks. No separate thread or cross-thread atomics are involved.
+The watchdog is a single wall timer (`watchdog_timer_`, created in the constructor so it survives lifecycle transitions) on the node's single-threaded executor. Each tick — every `watchdog.cycle_time` ms — `watchdogCheck()` compares the time since the last `~/fix` (`last_fix_time_`) against `watchdog.timeout` while monitoring is armed (`monitoring_enabled_`, set across `on_activate` / `on_deactivate`) and, on comms loss, runs `recovery()` **inline on the executor**. Because detection and recovery share the executor thread, lifecycle transitions and the teardown of the `gps_`/`updater_` objects never race the executor's own callbacks, and no cross-thread atomics are needed. This replaced an earlier dedicated `Watchdog` thread (`watchdog.hpp`, retained in tree but legacy and unused) that bridged into the executor via an atomic flag and a second timer.
+
+The freshness clock advances on **message arrival**, not on a *valid* fix — see *GNSS integrity limitations* above for why gating recovery on fix validity would produce a reset loop that prevents a fix.
 
 The recovery process is state-aware and escalates through several steps:
 1. **Soft Reset**: If the node is active and no prior reset has occurred, the receiver is reset with a u-blox **UBX-CFG-RST controlled software reset** (hot start — battery-backed data is kept for fast re-acquisition), and the node is deactivated/reactivated.
 2. **Hard Reset**: If a soft reset has already been performed, a hard reset is executed by deactivating and cleaning up the node, then reconfiguring and activating it (this reopens the serial connection).
 3. **GPIO Reset and Wait**: If both soft and hard resets have been attempted, the system pulses the GPIO line to reset the hardware, waits for a configurable period, and retries recovery.
 
-After each recovery attempt the node checks its state and, if not active, re-arms the recovery request and retries (with GPIO resets and delays) until successful. Retries are **iterative**, not recursive, so a prolonged outage cannot grow the call stack.
+After each recovery attempt the node checks its state and, if not active, re-arms the retry (`recovery_pending_`) and the next pass runs on the following watchdog tick, with GPIO resets and delays, until successful. Retries are **iterative**, not recursive, so a prolonged outage cannot grow the call stack.
+
+## Shared GPIO reset line
+
+Both GNSS nodes share one hardware reset line (`gpio.chipname` / `gpio.line_num`), so a pulse resets **both** receivers. `reset_gpio_line()` requests the line only for the duration of the pulse — LOW to assert for `gpio.reset_time` s, then HIGH to deassert — and releases it immediately, so the line is never held across the node's lifetime; the board pull-up holds it deasserted between pulses. If the line is already held by another consumer, the other GNSS node is mid-pulse (which covers both receivers), so this node logs and skips rather than fighting over the line.
+
+## Tests
+
+- `test/watchdog_test.cpp` — unit tests for the **legacy** `Watchdog` class (`watchdog.hpp`), retained only to keep that header verified while it remains in tree; the driver itself no longer uses it. Covers: dropout triggers the callback, a live link does not, a persistent outage re-fires bounded, and the timeout/check-interval fields are race-free under concurrent updates. Runs anywhere (header-only, no device).
+- `test/lifecycle_test.cpp` — drives `UbloxNode` through its states. The device-independent cases (construct → UNCONFIGURED, configure-without-device fails safe, shutdown-from-unconfigured) run in CI; the full configure → activate → deactivate → cleanup → reconfigure → reactivate ladder runs only when `UBLOX_TEST_DEVICE=/dev/<receiver>` is set, and is skipped otherwise.

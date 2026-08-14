@@ -204,7 +204,8 @@ UbloxNode::UbloxNode(const rclcpp::NodeOptions & options)
 
 void UbloxNode::fixCallback(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
 	// Stamp arrival on every message: the watchdog guards comms liveness, not fix
-	// validity (recovery is comms-gated; see docs).
+	// validity. Gating on fix validity would reset the receiver while it is still
+	// acquiring, which prevents it from ever reaching a fix.
 	last_fix_time_ = std::chrono::steady_clock::now();
 
 	// Surface loss of a usable position fix (throttled).

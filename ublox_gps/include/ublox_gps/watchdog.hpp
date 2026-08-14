@@ -4,11 +4,10 @@
 // LEGACY / UNUSED.
 //
 // This header-only Watchdog ran the comms-liveness check on its own std::thread
-// and bridged into the executor via an atomic flag. It has been replaced by a
-// single rclcpp wall timer on the node's executor (UbloxNode::watchdogCheck,
-// see ublox_gps/src/node.cpp and docs/error-handling-and-recovery.md), which
-// removes the extra thread, the cross-thread atomics, and the start/stop/join
-// bookkeeping. The class is retained only for reference and for its unit test
+// and bridged into the executor via an atomic flag. UbloxNode::watchdogCheck
+// now does the same work on a single rclcpp wall timer on the node's executor,
+// without the extra thread, the cross-thread atomics, or the start/stop/join
+// bookkeeping. The class is retained only for its unit test
 // (test/watchdog_test.cpp); it is no longer included or instantiated by the
 // driver. Do not wire it back into UbloxNode.
 // =============================================================================

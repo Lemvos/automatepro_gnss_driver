@@ -436,10 +436,9 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
   bool reset_fail_ = false;               // Flag to indicate if both reset failed
   int recovery_cycle_time_;               // Recovery cycle time in seconds
 
-  // Comms-liveness watchdog as a single wall timer on the node's executor,
-  // replacing the former separate Watchdog thread (see docs/error-handling-and-
-  // recovery.md). Because it runs on the executor, recovery() is invoked inline
-  // and never races the executor's own callbacks or lifecycle transitions, so no
+  // Comms-liveness watchdog as a single wall timer on the node's executor.
+  // Because it runs on the executor, recovery() is invoked inline and never
+  // races the executor's own callbacks or lifecycle transitions, so no
   // cross-thread atomics are required. All members below are touched only on the
   // executor thread.
   rclcpp::TimerBase::SharedPtr watchdog_timer_;

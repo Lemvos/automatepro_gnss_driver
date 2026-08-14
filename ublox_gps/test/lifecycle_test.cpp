@@ -1,7 +1,6 @@
 // Lifecycle transition tests for UbloxNode. Drives the node in-process and
 // asserts the resulting state at each transition. The device-independent cases
 // run anywhere; the full ladder needs a receiver (UBLOX_TEST_DEVICE).
-// See docs/error-handling-and-recovery.md.
 
 #include <cstdlib>
 #include <memory>

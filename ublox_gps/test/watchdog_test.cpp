@@ -1,8 +1,7 @@
 // Unit tests for the legacy GNSS comms watchdog (ublox_gps/watchdog.hpp).
-// NOTE: the driver no longer uses this class — the comms-liveness check now runs
-// as a wall timer in UbloxNode::watchdogCheck (see node.cpp). These tests are
-// retained only to keep the legacy header verified while it remains in tree.
-// Behaviour under test is described in docs/error-handling-and-recovery.md.
+// The driver no longer uses this class: the comms-liveness check now runs as a
+// wall timer in UbloxNode::watchdogCheck. These tests are retained only to keep
+// the legacy header verified while it remains in tree.
 
 #include <atomic>
 #include <chrono>
