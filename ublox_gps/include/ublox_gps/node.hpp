@@ -31,6 +31,7 @@
 #define UBLOX_GPS_NODE_HPP
 
 // STL
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -392,18 +393,37 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
    * @brief Set the GPIO chipname.
    * @param chipname the GPIO chipname
    */
-  void open_gpio_chipname(const std::string& chipname);
+  void openGpioChip(const std::string& chipname);
   
   /**
    * @brief Close the GPIO chipname.
    */
-  void close_gpio_chipname();
+  void closeGpioChip();
+
+  //! Outcome of an attempt to drive the shared reset line. The F9P and F9H
+  //! nodes are separate processes sharing one line, so "someone else is
+  //! pulsing" is a normal outcome, not an error: the line resets both
+  //! receivers, so the peer's pulse covers this one too.
+  enum class ResetPulse : uint8_t {
+    kIssued,        //!< this node drove the line
+    kPeerDriving,   //!< the other GNSS node holds it; its pulse resets both
+    kSkipped        //!< budget spent, line owned by a third party, or it failed
+  };
 
   /**
    * @brief Pulse the GPIO reset line (LOW for gpio_reset_time_ s, then HIGH).
    * The line is requested only for the pulse and released immediately.
    */
-  void reset_gpio_line();
+  ResetPulse resetGpioLine();
+
+  /**
+   * @brief Pulse the reset line unless the consecutive-pulse budget is spent.
+   * The line is shared with the other GNSS node and resets BOTH receivers, so a
+   * node that cannot recover must stop pulsing rather than hold the healthy
+   * receiver down. A peer pulse counts against the budget too, because it
+   * resets this node's receiver just the same. Cleared in heartbeat().
+   */
+  ResetPulse tryResetGpioLine();
 
   gpiod::chip chip_;                    // GPIO chip
   std::string chipname_;                // GPIO chipname
@@ -420,21 +440,56 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
   void recovery();
 
   /**
+   * @brief Cycle the node down to UNCONFIGURED and back up to ACTIVE.
+   *
+   * @details on_configure() -> initialize() -> initializeIo() is the only path
+   * that opens the serial port, so a recovery that does not pass through
+   * UNCONFIGURED cannot replace a stale connection. Every recovery rung
+   * therefore ends here; the rungs differ only in what they do to the hardware
+   * first. Each transition is guarded on the current state, so this is correct
+   * from ACTIVE, INACTIVE or UNCONFIGURED and stops where a transition fails.
+   */
+  void reopen();
+
+  /**
    * @brief Watchdog tick (runs on the executor via watchdog_timer_).
    * Triggers recovery() on comms loss (no ~/fix within watchdog_timeout_ while
    * monitoring is enabled) and drives the iterative recovery retry.
    */
   void watchdogCheck();
 
-  /** 
+  /**
    * @brief Callback for the Heartbeat function.
    */
   void heartbeat();
 
-  bool soft_reset_ = false;               // Flag to indicate if a soft reset is needed (deactivation only)
-  bool hard_reset_ = false;               // Flag to indicate if a hard reset is needed (deactivation + cleanup)
-  bool reset_fail_ = false;               // Flag to indicate if both reset failed
-  int recovery_cycle_time_;               // Recovery cycle time in seconds
+  /**
+   * @brief Delay before the next recovery pass: recovery_cycle_time_ doubled
+   * once per consecutive failed pass, capped at recovery_backoff_max_s_.
+   */
+  std::chrono::seconds recoveryBackoff() const;
+
+  //! Escalation rung for the next recovery pass, ordered by how invasive it is
+  //! toward the hardware. Every rung ends in reopen(); they differ only in what
+  //! they do to the receiver first. Advances once per pass, and drops back to
+  //! kReopen in heartbeat() when data returns.
+  enum class RecoveryStage : uint8_t {
+    kReopen,        //!< host side only: cycle the node, receiver untouched
+    kDeviceReset,   //!< UBX CFG-RST hot start, then reopen
+    kHardwareReset  //!< pulse the shared reset line, then reopen (last rung)
+  };
+
+  RecoveryStage recovery_stage_ = RecoveryStage::kReopen;
+  int recovery_cycle_time_;               // Base retry interval in seconds
+  int recovery_backoff_max_s_;            // Ceiling for the doubling retry interval [s]
+  int recovery_gpio_pulse_limit_;         // Max consecutive pulses of the shared reset line
+  int recovery_attempts_ = 0;             // Consecutive recovery passes since data last arrived
+  int gpio_pulses_ = 0;                   // Consecutive reset pulses since data last arrived
+
+  // Earliest time the next recovery pass may run. Set after every pass so a
+  // persistent fault paces the ladder instead of re-running it at timer rate;
+  // cleared in heartbeat() when data returns.
+  std::chrono::steady_clock::time_point next_recovery_time_;
 
   // Comms-liveness watchdog as a single wall timer on the node's executor.
   // Because it runs on the executor, recovery() is invoked inline and never

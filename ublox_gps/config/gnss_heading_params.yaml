@@ -14,17 +14,23 @@ automatepro_gnss_heading_node:
     gpio:
       chipname: "gpiochip0"
       line_num: 134
-      reset_time: 1
+      reset_time_s: 1
 
     # Recovery configuration
     recovery:
-      cycle_time: 1
+      cycle_time_s: 1           # Base retry interval [s]; doubles per failed pass
+      backoff_max_s: 60       # Ceiling for the doubling retry interval [s]
+      gpio_pulse_limit: 3     # Consecutive pulses of the SHARED reset line before
+                              # this node stops pulsing (a pulse resets BOTH
+                              # receivers, so an unrecoverable heading receiver
+                              # must not hold the position receiver down).
+                              # Budget is restored as soon as data returns.
 
     # Comms-liveness watchdog (a wall timer on the node executor; fires recovery
-    # when no ~/fix arrives within 'timeout', checked every 'cycle_time').
+    # when no ~/fix arrives within 'timeout_ms', checked every 'cycle_time_ms').
     watchdog:
-      timeout: 3000
-      cycle_time: 500
+      timeout_ms: 3000
+      cycle_time_ms: 500
 
     # Enable u-blox gnss message publishers
     publish:
@@ -37,4 +43,8 @@ automatepro_gnss_heading_node:
                                 # heading integrity monitoring (covariance + freshness)
       nmea: false
       mon:
-        all: true
+        hw: true              # UBX-MON-HW: accepted and emitted by this F9H
+        sys: false            # UBX-MON-SYS: this F9H firmware NACKs CFG-MSG for
+                              # it (the F9P, on a different image, accepts it).
+                              # Requesting it only produced an ERROR-level NACK
+                              # and a permanently silent ~/monsys topic.

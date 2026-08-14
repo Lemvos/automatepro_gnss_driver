@@ -17,16 +17,16 @@ ublox_gps_base_node:
     gpio:
       chipname: "gpiochip0"
       line_num: 134
-      reset_time: 1
+      reset_time_s: 1
     
     # Recovery configuration
     recovery:
-      cycle_time: 1
+      cycle_time_s: 1
     
     # Watchdog configuration
     watchdog:
-      timeout: 3000
-      cycle_time: 500
+      timeout_ms: 3000
+      cycle_time_ms: 500
 
     gnss:
       gps: true
