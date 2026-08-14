@@ -201,6 +201,44 @@ To publish a given u-blox message to a ROS topic, set the parameter shown below 
 A sample launch file `ublox_device.launch` loads the parameters from a `.yaml` file in the `ublox_gps/config` folder, sample configuration files are included. The required arguments are `node_name` and `param_file_name`.
 The two topics to which you should subscribe are `~fix` and `~fix_velocity`. The angular component of `fix_velocity` is unused.
 
+## Running without root (serial-port permissions)
+
+The node only needs access to the GNSS serial device (`/dev/ttyACM*`, owned by group `dialout`) and the GPIO reset chip (`/dev/gpiochip0`, group `gpio`); it does **not** need to run as `root`. Grant the service user the `dialout` group (most systems already grant `gpio`):
+
+```bash
+sudo usermod -aG dialout <user>   # -a appends; without it, -G REPLACES the user's groups
+```
+
+Re-login or restart the service for the membership to take effect. In a systemd unit, set `User=<user>` and `Group=<user>`; systemd applies the user's supplementary groups automatically. As a bonus, running as a normal user makes the node's FastDDS shared-memory segments readable by same-user CLI tools (`ros2 topic echo|hz`), which otherwise show no data for root-owned publishers.
+
+## Moving-baseline heading configuration (`scripts/`)
+
+The moving-baseline heading is computed **on the receivers**, not in ROS. The F9P (moving base) must stream, over its UART2 to the F9H (rover), the reference position (RTCM **4072.0** + 4072.1) **and** the base observations (RTCM **MSM4**: 1074/1084/1094/1124); the F9H must accept RTCM3 on its UART and output `UBX-NAV-RELPOSNED`. If any of those are missing the rover reports `NAV-RELPOSNED` with `flags = 1` (only `GNSS_FIX_OK`; no `DIFF_SOLN`/`REL_POS_VALID`/`REL_POS_HEAD_VALID`), so `~/navheading` stays at a placeholder heading with covariance 1000 and the driver logs "GNSS heading not valid". This is device configuration, independent of this driver and of any NTRIP/SPARTN correction stream (NTRIP corrects absolute position; it is not needed for heading). See the [u-blox Moving Base Application Note (UBX-19009093)](https://content.u-blox.com/sites/default/files/documents/ZED-F9P-MovingBase_AppNote_UBX-19009093.pdf).
+
+Two helper scripts inspect and provision this without u-center. They talk UBX over the serial ports, so they need [`pyubx2`](https://pypi.org/project/pyubx2/) and the ports **free** (stop the GNSS process/container first):
+
+```bash
+sudo python3 -m pip install pyubx2      # one-time; sudo because the scripts run as root for /dev/ttyACM*
+
+# stop whatever owns the receivers' ports (the scripts open them by stable
+# by-id path, so they always hit the right module even if ttyACM* renumbers):
+docker stop automatepro-core-driver     # or: sudo systemctl stop <gnss-service>
+
+# read the current config of both receivers (RAM + FLASH), non-destructive:
+sudo python3 scripts/gnss_config_probe.py          # curated moving-base keys
+
+# provision both receivers to the known-good moving-base config and save to flash:
+sudo python3 scripts/gnss_apply_default.py         # dry-run preview
+sudo python3 scripts/gnss_apply_default.py --apply # write (expect ACK-ACK)
+sudo python3 scripts/gnss_config_probe.py          # verify
+
+docker start automatepro-core-driver
+```
+
+`gnss_apply_default.py` writes the verified-good set to RAM + BBR + **FLASH** (so it survives resets): on the F9P it enables `4072.0`/`4072.1` + MSM4 (`1074/1084/1094/1124`) on UART2 (and disables MSM7/1230 to match) and sets `UART2OUTPROT_RTCM3X`; on the F9H it enables `UART1/2 INPROT_RTCM3X` and `NAV-RELPOSNED` output. It does **not** change UART2 baud by default; pass `--uart2-baud 115200` to also set the link baud on **both** modules (they must match — see [docs/gnss-movingbase-config.md](docs/gnss-movingbase-config.md)). After applying, allow 30–60 s for the rover to fix the baseline, then `flags` on `NAV-RELPOSNED` should show `DIFF_SOLN | REL_POS_VALID | REL_POS_HEAD_VALID`. Edit the `DEVICES` table in the script to capture a different known-good profile.
+
+The verified-good profile, the as-found vs known-good captures, and a per-key explanation of every change are documented in [docs/gnss-movingbase-config.md](docs/gnss-movingbase-config.md).
+
 # Version history
 
 * **1.1.4**:
