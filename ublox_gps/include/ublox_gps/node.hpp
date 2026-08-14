@@ -56,8 +56,9 @@
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include "lifecycle_msgs/msg/transition_description.hpp"
 
-// Watchdog
-#include "ublox_gps/watchdog.hpp"
+// Comms-liveness watchdog. The former separate Watchdog thread
+// (ublox_gps/watchdog.hpp) has been replaced by a single wall timer on the
+// node's executor; the header is kept only as legacy/unused.
 
 // GPIO
 #include <gpiod.hpp>
@@ -418,6 +419,13 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
    */
   void recovery();
 
+  /**
+   * @brief Watchdog tick (runs on the executor via watchdog_timer_).
+   * Triggers recovery() on comms loss (no ~/fix within watchdog_timeout_ while
+   * monitoring is enabled) and drives the iterative recovery retry.
+   */
+  void watchdogCheck();
+
   /** 
    * @brief Callback for the Heartbeat function.
    */
@@ -428,15 +436,18 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
   bool reset_fail_ = false;               // Flag to indicate if both reset failed
   int recovery_cycle_time_;               // Recovery cycle time in seconds
 
-  // Recovery is requested on the watchdog thread and run on the executor via
-  // recovery_timer_ (see docs/error-handling-and-recovery.md).
-  std::atomic<bool> recovery_requested_{false};
-  rclcpp::TimerBase::SharedPtr recovery_timer_;
-
-  // Watchdog
-  std::shared_ptr<Watchdog> watchdog_;    // Watchdog 
-  int watchdog_timeout_;                  // Watchdog timeout in milliseconds
-  int watchdog_cycle_time_;               // Watchdog cycle time in milliseconds
+  // Comms-liveness watchdog as a single wall timer on the node's executor,
+  // replacing the former separate Watchdog thread (see docs/error-handling-and-
+  // recovery.md). Because it runs on the executor, recovery() is invoked inline
+  // and never races the executor's own callbacks or lifecycle transitions, so no
+  // cross-thread atomics are required. All members below are touched only on the
+  // executor thread.
+  rclcpp::TimerBase::SharedPtr watchdog_timer_;
+  std::chrono::steady_clock::time_point last_fix_time_;  // arrival of the last ~/fix
+  bool monitoring_enabled_ = false;       // comms guard armed (active state only)
+  bool recovery_pending_ = false;         // re-arm for the next iterative retry
+  int watchdog_timeout_;                  // Comms-loss timeout in milliseconds
+  int watchdog_cycle_time_;               // Watchdog check interval in milliseconds
 
   /* ********* */
   /* Debugging */

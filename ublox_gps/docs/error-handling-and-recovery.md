@@ -1,28 +1,35 @@
 # Error handling & recovery
 
 Design notes for the watchdog/recovery, freshness guards, and lifecycle/shutdown
-code in `node.cpp`, `node.hpp`, `watchdog.hpp`, and `node_main.cpp`. This is the
-rationale behind the code; the review findings that motivated it are in the
-top-level `GPS_ANALYSIS.md`.
+code in `node.cpp`, `node.hpp`, and `node_main.cpp` (`watchdog.hpp` is legacy and
+no longer used by the driver). This is the rationale behind the code; the review
+findings that motivated it are in the top-level `GPS_ANALYSIS.md`.
 
 ## Watchdog and recovery
 
-The `Watchdog` monitors **data reception**: `fixCallback` resets it on every
-`~/fix` message, and on timeout it requests recovery. Key points:
+The watchdog monitors **data reception**: `fixCallback` records the arrival time
+of every `~/fix` message (`last_fix_time_`), and on timeout recovery is
+triggered. Key points:
 
-- **Recovery is comms-gated, not fix-gated.** The watchdog resets on *message
-  arrival*, not on a *valid* fix. The receiver keeps emitting `NAV-PVT` (with
-  `STATUS_NO_FIX`) while acquiring, so gating recovery on fix validity would
-  reset the receiver before it could re-acquire — a reset loop that prevents a
-  fix. The watchdog timeout (seconds) is far shorter than GNSS re-acquisition,
-  so loss of *fix/heading/RTK quality* is **surfaced**, never used to trigger a
-  hardware reset.
-- **Requested on the watchdog thread, run on the executor.** The watchdog
-  callback only sets the `recovery_requested_` atomic. `recovery_timer_` (a wall
-  timer created in the constructor so it survives lifecycle transitions) runs
-  `recovery()` on the single-threaded executor, so lifecycle transitions and the
-  `gps_`/`updater_` teardown never race the executor's own callbacks.
-- **Iterative, not recursive.** `recovery()` re-arms `recovery_requested_` on a
+- **Recovery is comms-gated, not fix-gated.** The freshness clock advances on
+  *message arrival*, not on a *valid* fix. The receiver keeps emitting `NAV-PVT`
+  (with `STATUS_NO_FIX`) while acquiring, so gating recovery on fix validity
+  would reset the receiver before it could re-acquire — a reset loop that
+  prevents a fix. The watchdog timeout (seconds) is far shorter than GNSS
+  re-acquisition, so loss of *fix/heading/RTK quality* is **surfaced**, never
+  used to trigger a hardware reset.
+- **A single wall timer on the executor.** `watchdog_timer_` (created in the
+  constructor so it survives lifecycle transitions) fires every
+  `watchdog.cycle_time` ms and runs `watchdogCheck()` on the single-threaded
+  executor. It compares `now - last_fix_time_` against `watchdog.timeout` while
+  monitoring is armed (`monitoring_enabled_`, set across `on_activate` /
+  `on_deactivate`) and runs `recovery()` **inline** on comms loss. Because
+  detection and recovery share the executor thread, lifecycle transitions and the
+  `gps_`/`updater_` teardown never race the executor's own callbacks, and no
+  cross-thread atomics are needed. This replaced an earlier dedicated `Watchdog`
+  thread (`watchdog.hpp`, now legacy/unused) that bridged into the executor via
+  an atomic flag and a second timer.
+- **Iterative, not recursive.** `recovery()` re-arms `recovery_pending_` on a
   non-active end state and returns; the next pass runs on the timer. (It used to
   recurse on a persistent outage, growing the stack until the process crashed.)
 - **Escalation:** soft → hard → GPIO pulse.
@@ -87,8 +94,10 @@ A consumer must not act on a stale last-known solution:
 
 ## Tests
 
-- `test/watchdog_test.cpp` — unit tests for the watchdog: dropout triggers
-  recovery, a live link does not, a persistent outage re-fires bounded, and the
+- `test/watchdog_test.cpp` — unit tests for the **legacy** `Watchdog` class
+  (`watchdog.hpp`), retained only to keep that header verified while it remains
+  in tree; the driver itself no longer uses it. Covers: dropout triggers the
+  callback, a live link does not, a persistent outage re-fires bounded, and the
   timeout/check-interval fields are race-free under concurrent updates. Runs
   anywhere (header-only, no device).
 - `test/lifecycle_test.cpp` — drives `UbloxNode` through its states. The

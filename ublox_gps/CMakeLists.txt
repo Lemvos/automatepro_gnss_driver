@@ -125,7 +125,9 @@ ament_export_targets(export_${PROJECT_NAME})
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
 
-  # Comms watchdog unit tests (header-only target, no driver/asio dependency).
+  # Legacy comms watchdog unit tests (header-only target, no driver/asio
+  # dependency). The driver now uses a wall timer (UbloxNode::watchdogCheck);
+  # this test keeps the retained legacy header verified.
   ament_add_gtest(${PROJECT_NAME}_watchdog_test test/watchdog_test.cpp)
   if(TARGET ${PROJECT_NAME}_watchdog_test)
     target_include_directories(${PROJECT_NAME}_watchdog_test PRIVATE

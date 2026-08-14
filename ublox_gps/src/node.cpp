@@ -192,33 +192,20 @@ UbloxNode::UbloxNode(const rclcpp::NodeOptions & options)
 	// Params must be set before initializing IO
 	getRosParams();
 
-	// Initialize the Watchdog
-	auto timeout = std::chrono::milliseconds(watchdog_timeout_);
-	auto cycle_time = std::chrono::milliseconds(watchdog_cycle_time_); 
-	watchdog_ = std::make_shared<Watchdog>();
-	watchdog_->set_timeout(std::chrono::milliseconds(timeout)); 
-	watchdog_->set_check_interval(std::chrono::milliseconds(cycle_time));
-	watchdog_->set_callback([this]() {
-		RCLCPP_ERROR(this->get_logger(), "Watchdog timeout! No data received from sensor. Requesting recovery...");
-		// Request only; recovery() must run on the executor (see docs).
-		this->recovery_requested_.store(true);
-	});
-
-	// Runs recovery() on the executor; created in the ctor so it survives
-	// lifecycle transitions.
-	recovery_timer_ = this->create_wall_timer(
-		std::chrono::milliseconds(200),
-		[this]() {
-			if (this->recovery_requested_.exchange(false)) {
-				this->recovery();
-			}
-		});
+	// Comms-liveness watchdog: a single wall timer on the node's executor that
+	// replaces the former separate Watchdog thread. It fires every
+	// watchdog_cycle_time_ ms and runs watchdogCheck() inline on the executor, so
+	// recovery() never races the executor's callbacks or lifecycle transitions.
+	// Created in the ctor so it survives lifecycle transitions.
+	watchdog_timer_ = this->create_wall_timer(
+		std::chrono::milliseconds(watchdog_cycle_time_),
+		[this]() { this->watchdogCheck(); });
 }
 
 void UbloxNode::fixCallback(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
-	// Reset on every message: the watchdog guards comms liveness, not fix
+	// Stamp arrival on every message: the watchdog guards comms liveness, not fix
 	// validity (recovery is comms-gated; see docs).
-	watchdog_->reset();
+	last_fix_time_ = std::chrono::steady_clock::now();
 
 	// Surface loss of a usable position fix (throttled).
 	if (msg->status.status < sensor_msgs::msg::NavSatStatus::STATUS_FIX) {
@@ -1073,12 +1060,18 @@ UbloxNode::on_activate(const rclcpp_lifecycle::State & state)
           if (poller_->is_canceled()) 
             poller_->reset();
 
-        // Start the watchdog
-        watchdog_->start();
+        // Arm the comms-liveness watchdog: seed the freshness clock and enable
+        // the timer's staleness check (the timer itself runs continuously).
+        last_fix_time_ = std::chrono::steady_clock::now();
+        monitoring_enabled_ = true;
 
-		// Initialize the fix subscriber
+		// Initialize the fix subscriber. Subscribe to the private topic "~/fix"
+		// (the same name the firmware component publishes on) so it resolves to
+		// the node's fully-qualified name under ANY namespace. Hand-building
+		// "/" + get_name() + "/fix" dropped the namespace and broke the watchdog
+		// feed once the node is namespaced (e.g. /sensor/gnss/position).
 		fix_subscriber_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
-			std::string("/") + this->get_name() + "/fix", rclcpp::SystemDefaultsQoS(),
+			"~/fix", rclcpp::SystemDefaultsQoS(),
 			std::bind(&UbloxNode::fixCallback, this, std::placeholders::_1));
 
 		// Heading subscriber (heading nodes only).
@@ -1120,8 +1113,8 @@ UbloxNode::on_deactivate(const rclcpp_lifecycle::State & state)
         if (!poller_->is_canceled()) 
           poller_->cancel();
     
-      // Stop the watchdog
-      watchdog_->stop();
+      // Disarm the comms-liveness watchdog (timer keeps running but stops checking).
+      monitoring_enabled_ = false;
 
       // Destroy subscribers
       fix_subscriber_.reset();
@@ -1195,9 +1188,10 @@ UbloxNode::on_shutdown(const rclcpp_lifecycle::State & state)
             state.id(),
             this->get_current_state().label().c_str(),
             this->get_current_state().id()
-        ); 
-        
-        watchdog_->stop();
+        );
+
+        // Disarm the comms-liveness watchdog.
+        monitoring_enabled_ = false;
 
         shutdown();
     }
@@ -1220,9 +1214,37 @@ void UbloxNode::heartbeat()
     if (this->soft_reset_) this->soft_reset_ = false;   // Reset soft_reset flag 
 }
 
+void UbloxNode::watchdogCheck()
+{
+    // Iterative recovery retry: a previous recovery() pass that could not reach
+    // ACTIVE re-armed this. Run the next pass here, on the executor, so retries
+    // never recurse and a prolonged outage cannot grow the call stack.
+    if (recovery_pending_) {
+        recovery_pending_ = false;
+        recovery();
+        return;
+    }
+
+    // Only guard comms liveness while active (armed across on_activate /
+    // on_deactivate). Outside the active state there is nothing to monitor.
+    if (!monitoring_enabled_) {
+        return;
+    }
+
+    // Comms loss: no ~/fix received within the timeout window. recovery() runs
+    // inline on the executor (see header note).
+    if (std::chrono::steady_clock::now() - last_fix_time_
+            >= std::chrono::milliseconds(watchdog_timeout_)) {
+        RCLCPP_ERROR(get_logger(),
+            "Watchdog timeout! No data received from sensor for >%d ms. Recovering...",
+            watchdog_timeout_);
+        recovery();
+    }
+}
+
 void UbloxNode::recovery()
 {
-    try 
+    try
     {
         RCLCPP_INFO(get_logger(), "Recovery function called. Attempting to recover...");
 
@@ -1309,9 +1331,9 @@ void UbloxNode::recovery()
         RCLCPP_ERROR(get_logger(), "Recovery failed: %s", e.what());
     }
 
-    // Re-arm (not recurse): the next pass runs on the executor via recovery_timer_.
+    // Re-arm (not recurse): the next pass runs on the executor via watchdog_timer_.
     if (this->get_current_state().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
-        this->recovery_requested_.store(true);
+        this->recovery_pending_ = true;
     }
 }
 

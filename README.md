@@ -391,9 +391,9 @@ This design ensures that the node can be safely reconfigured, restarted, or shut
 
 # Recovery System Overview
 
-The node implements an integrated recovery system to handle communication failures or hardware issues. A watchdog timer monitors **data reception** from the GNSS device (it is reset on every `~/fix` message). If no message is received within the configured timeout, the watchdog requests recovery. Recovery targets **communication loss**, not loss of fix/RTK quality — see *GNSS integrity limitations* above.
+The node implements an integrated recovery system to handle communication failures or hardware issues. A watchdog monitors **data reception** from the GNSS device (the arrival time of the last `~/fix` is recorded on every message). If no message is received within the configured timeout, recovery is triggered. Recovery targets **communication loss**, not loss of fix/RTK quality — see *GNSS integrity limitations* above.
 
-The watchdog runs on its own thread but only *requests* recovery (an atomic flag); recovery itself runs on the node's executor (via a short-period timer) so that lifecycle transitions and the teardown of the GPS/diagnostic objects never race the executor's own callbacks.
+The watchdog is a single wall timer on the node's executor (it replaced an earlier dedicated watchdog thread). Each tick — every `watchdog.cycle_time` ms — compares the time since the last `~/fix` against `watchdog.timeout` and, on comms loss, runs recovery **inline on the executor**, so lifecycle transitions and the teardown of the GPS/diagnostic objects never race the executor's own callbacks. No separate thread or cross-thread atomics are involved.
 
 The recovery process is state-aware and escalates through several steps:
 1. **Soft Reset**: If the node is active and no prior reset has occurred, the receiver is reset with a u-blox **UBX-CFG-RST controlled software reset** (hot start — battery-backed data is kept for fast re-acquisition), and the node is deactivated/reactivated.
