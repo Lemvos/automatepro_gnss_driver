@@ -196,8 +196,22 @@ void AsyncWorker<StreamT>::doWrite() {
   if (out_.size() == 0) {
     return;
   }
-  // Write all the data in the out buffer
-  asio::write(*stream_, asio::buffer(out_.data(), out_.size()));
+  // Write all the data in the out buffer. The error_code overload is required,
+  // not merely preferred: doWrite runs on the io_service thread, and the
+  // throwing overload propagates std::system_error out of that thread with no
+  // handler, terminating the whole process. A write to a receiver that has just
+  // disappeared is exactly the outage the comms watchdog exists to recover
+  // from, so drop the buffer and let it do its job. The read path already
+  // reports errors this way.
+  asio::error_code error;
+  asio::write(*stream_, asio::buffer(out_.data(), out_.size()), error);
+  if (error) {
+    RCLCPP_ERROR(logger_, "U-Blox ASIO output buffer write error: %s, %li",
+                 error.message().c_str(), out_.size());
+    out_.clear();
+    write_condition_.notify_all();
+    return;
+  }
 
   if (debug_ >= 2) {
     // Print the data that was sent

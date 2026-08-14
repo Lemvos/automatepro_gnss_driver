@@ -136,6 +136,13 @@ if(BUILD_TESTING)
     target_link_libraries(${PROJECT_NAME}_watchdog_test Threads::Threads)
   endif()
 
+  # Gps guards on the teardown / failed-bring-up boundary, where the object
+  # outlives its I/O worker. No device needed.
+  ament_add_gtest(${PROJECT_NAME}_gps_test test/gps_test.cpp)
+  if(TARGET ${PROJECT_NAME}_gps_test)
+    target_link_libraries(${PROJECT_NAME}_gps_test ublox_gps)
+  endif()
+
   # Lifecycle transition tests: drive the real UbloxNode through its states.
   # The device-independent cases run anywhere; the full ladder needs a receiver
   # (UBLOX_TEST_DEVICE) and is skipped otherwise.
