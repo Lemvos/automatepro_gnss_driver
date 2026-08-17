@@ -92,3 +92,6 @@ gen/*
 
 # VS Code
 *.vscode
+
+# Python
+__pycache__/

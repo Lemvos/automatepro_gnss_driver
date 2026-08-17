@@ -1,0 +1,48 @@
+# Configuration Settings for F9P device in Moving Base Mode
+automatepro_gnss_position_node:
+  ros__parameters:
+    debug: 0                    # Range 0-4 (0 means no debug statements will print)
+
+    device: /dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver_F9P-if00
+    frame_id: gnss_position
+
+    config_on_startup: false    # If false, the node will not override configurations of the device on startup
+                                # Device should be configured with u-center and configurations should be saved in flash
+                                # Please use the configuration file provided by Lemvos
+
+    # GPIO configuration (shared hardware reset line; pulsed only during recovery)
+    gpio:
+      chipname: "gpiochip0"
+      line_num: 134
+      reset_time_s: 1
+
+    # Recovery configuration
+    recovery:
+      cycle_time_s: 1           # Base retry interval [s]; doubles per failed pass
+      backoff_max_s: 60       # Ceiling for the doubling retry interval [s]
+      gpio_pulse_limit: 3     # Consecutive pulses of the SHARED reset line before
+                              # this node stops pulsing (a pulse resets BOTH
+                              # receivers, so an unrecoverable position receiver
+                              # must not hold the heading receiver down).
+                              # Budget is restored as soon as data returns.
+
+    # Comms-liveness watchdog (a wall timer on the node executor; fires recovery
+    # when no ~/fix arrives within 'timeout_ms', checked every 'cycle_time_ms').
+    watchdog:
+      timeout_ms: 3000
+      cycle_time_ms: 500
+
+    # Enable u-blox gnss message publishers
+    publish:
+      all: false
+      aid:
+        hui: false
+      nav:
+        all: false
+        posllh: false
+        posecef: false
+        relposned: false
+      nmea: true
+      mon:
+        hw: true
+        sys: true

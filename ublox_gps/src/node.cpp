@@ -49,6 +49,7 @@
 #include <ublox_msgs/msg/cfg_inf_block.hpp>
 #include <ublox_msgs/msg/cfg_nav5.hpp>
 #include <ublox_msgs/msg/cfg_prt.hpp>
+#include <ublox_msgs/msg/cfg_rst.hpp>
 #include <ublox_msgs/msg/inf.hpp>
 #include <ublox_msgs/msg/mon_ver.hpp>
 #include <ublox_msgs/msg/nav_clock.hpp>
@@ -74,6 +75,11 @@
 #include <ublox_gps/ublox_firmware9.hpp>
 
 namespace ublox_node {
+
+//! Consumer label this driver requests the shared reset line under. Both the
+//! F9P and the F9H node use it, which is how each recognises that a line it
+//! finds busy is being pulsed by its peer rather than by a third party.
+constexpr const char * kResetConsumer = "gpio_reset";
 
 /**
  * @brief Determine dynamic model from human-readable string.
@@ -181,7 +187,7 @@ UbloxNode::UbloxNode(const rclcpp::NodeOptions & options)
 	// Get node name
 	RCLCPP_INFO(get_logger(), "Initializing Node: %s", this->get_name());
 
-	debug_ = this->declare_parameter("debug", 1);
+	debug_ = this->declare_parameter("debug", 0);
 	if (debug_) {
 		if (rcutils_logging_set_logger_level("ublox_gps_node", RCUTILS_LOG_SEVERITY_DEBUG) != RCUTILS_RET_OK) {
 		RCLCPP_WARN(this->get_logger(), "Failed to set the debugging level");
@@ -191,34 +197,79 @@ UbloxNode::UbloxNode(const rclcpp::NodeOptions & options)
 	// Params must be set before initializing IO
 	getRosParams();
 
-	// Initialize the Watchdog
-	auto timeout = std::chrono::milliseconds(watchdog_timeout_);
-	auto cycle_time = std::chrono::milliseconds(watchdog_cycle_time_); 
-	watchdog_ = std::make_shared<Watchdog>();
-	watchdog_->set_timeout(std::chrono::milliseconds(timeout)); 
-	watchdog_->set_check_interval(std::chrono::milliseconds(cycle_time));
-	watchdog_->set_callback([this]() {
-		RCLCPP_ERROR(this->get_logger(), "Watchdog timeout! No data received from sensor. Resetting...");
+	// Open the GPIO chip for the node's lifetime. The reset pulse has to be
+	// available in EVERY state: once on_cleanup has released the driver and a
+	// re-configure has failed, the hardware reset is the only recovery step
+	// left, and a chip handle opened inside on_configure is already gone by
+	// then. Holding the chip claims no line; the reset line itself is requested
+	// only for the duration of a pulse.
+	this->openGpioChip(chipname_);
 
-		// Call the lifecycle recovery method
-		this->recovery();
-	});
+	// Comms-liveness watchdog: a single wall timer on the node's executor that
+	// replaces the former separate Watchdog thread. It fires every
+	// watchdog_cycle_time_ ms and runs watchdogCheck() inline on the executor, so
+	// recovery() never races the executor's callbacks or lifecycle transitions.
+	// Created in the ctor so it survives lifecycle transitions.
+	watchdog_timer_ = this->create_wall_timer(
+		std::chrono::milliseconds(watchdog_cycle_time_),
+		[this]() { this->watchdogCheck(); });
 }
 
 void UbloxNode::fixCallback(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
-	// Process the NavSatFix message
-	//RCLCPP_INFO(this->get_logger(), "Received NavSatFix: latitude: %f, longitude: %f, altitude: %f",
-	//			msg->latitude, msg->longitude, msg->altitude);
+	// Stamp arrival on every message: the watchdog guards comms liveness, not fix
+	// validity. Gating on fix validity would reset the receiver while it is still
+	// acquiring, which prevents it from ever reaching a fix.
+	last_fix_time_ = std::chrono::steady_clock::now();
 
-	// Reset the watchdog timer
-	watchdog_->reset();
+	// Surface loss of a usable position fix (throttled).
+	if (msg->status.status < sensor_msgs::msg::NavSatStatus::STATUS_FIX) {
+		RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+			"GNSS position fix not valid (status=%d): position is unreliable.",
+			static_cast<int>(msg->status.status));
+	}
 
-	// Trigger heartbeat
+	// Freshness guard: surface a heading stream that has stalled while position
+	// is still streaming. Window reuses the comms-freshness window.
+	if (monitor_heading_) {
+		const auto heading_age = std::chrono::steady_clock::now() - last_heading_time_;
+		if (heading_age > std::chrono::milliseconds(watchdog_timeout_)) {
+			RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+				"GNSS heading stream stale (no valid heading for >%d ms while position is streaming): heading is unreliable.",
+				watchdog_timeout_);
+		}
+	}
+
 	this->heartbeat();
 }
 
+void UbloxNode::headingCallback(const sensor_msgs::msg::Imu::SharedPtr msg) {
+	// An invalid heading (covariance left at kInvalidHeadingCovariance by the
+	// producer) is surfaced and does not refresh the freshness clock.
+	if (msg->orientation_covariance[8] >= kInvalidHeadingCovariance) {
+		RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+			"GNSS heading not valid: orientation is unreliable.");
+		return;
+	}
+
+	last_heading_time_ = std::chrono::steady_clock::now();
+}
+
 void UbloxNode::rtcmCallback(const rtcm_msgs::msg::Message::SharedPtr msg) {
-  gps_->sendRtcm(msg->message);
+  // gps_ exists only between on_configure and on_cleanup, and a write to a
+  // receiver that has just disappeared throws std::system_error from asio.
+  // Either escaping this callback terminates the process, which would kill the
+  // node before the comms watchdog can run the recovery ladder - the outage is
+  // exactly what the watchdog is there to handle.
+  if (!gps_) {
+    return;
+  }
+
+  try {
+    gps_->sendRtcm(msg->message);
+  } catch (const std::exception & e) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      "Failed to forward RTCM to the receiver: %s", e.what());
+  }
 }
 
 void UbloxNode::addFirmwareInterface() {
@@ -300,6 +351,10 @@ void UbloxNode::getRosParams() {
   // Measurement rate params
   rate_ = this->declare_parameter("rate", 4.0);  // in Hz
   checkMin(rate_, 0.0, "rate");
+  // rate_ divides meas_rate_ below and checkMin permits 0, so reject it here.
+  if (rate_ <= 0.0) {
+    throw std::runtime_error("Invalid settings: rate must be > 0 Hz");
+  }
 
   nav_rate_ = declareRosIntParameter<uint16_t>(this, "nav_rate", 1);  // # of measurement rate cycles
 
@@ -498,14 +553,32 @@ void UbloxNode::getRosParams() {
   // GPIO parameters
   chipname_ = this->declare_parameter("gpio.chipname", std::string("gpiochip0"));
   line_num_ = this->declare_parameter("gpio.line_num", 134);
-  gpio_reset_time_ = this->declare_parameter("gpio.reset_time", 1);
+  gpio_reset_time_ = this->declare_parameter("gpio.reset_time_s", 1);
   
   // Recovery parameters
-  recovery_cycle_time_ = this->declare_parameter("recovery.cycle_time", 1);
+  recovery_cycle_time_ = this->declare_parameter("recovery.cycle_time_s", 1);
+  recovery_backoff_max_s_ = this->declare_parameter("recovery.backoff_max_s", 60);
+  recovery_gpio_pulse_limit_ = this->declare_parameter("recovery.gpio_pulse_limit", 3);
+
+  // The base interval is doubled per consecutive failure, so a non-positive
+  // base would remove the backoff and let the ladder spin at timer rate.
+  if (recovery_cycle_time_ <= 0) {
+    throw std::runtime_error("Invalid settings: recovery.cycle_time_s must be > 0 s");
+  }
+  if (recovery_backoff_max_s_ < recovery_cycle_time_) {
+    throw std::runtime_error(
+      "Invalid settings: recovery.backoff_max_s must be >= recovery.cycle_time_s");
+  }
+  if (recovery_gpio_pulse_limit_ < 0) {
+    throw std::runtime_error("Invalid settings: recovery.gpio_pulse_limit must be >= 0");
+  }
 
   // Watchdog parameters
-  watchdog_timeout_ = this->declare_parameter("watchdog.timeout", 1000);
-  watchdog_cycle_time_ = this->declare_parameter("watchdog.cycle_time", 500);
+  watchdog_timeout_ = this->declare_parameter("watchdog.timeout_ms", 1000);
+  watchdog_cycle_time_ = this->declare_parameter("watchdog.cycle_time_ms", 500);
+
+  // Only heading nodes publish (and therefore monitor) a heading solution.
+  monitor_heading_ = getRosBoolean(this, "publish.nav.heading");
 
   // Create publishers based on parameters
   if (getRosBoolean(this, "publish.nav.status")) {
@@ -958,7 +1031,9 @@ void UbloxNode::initialize() {
 }
 
 void UbloxNode::shutdown() {
-  if (gps_->isInitialized()) {
+  // gps_ is created in on_configure(); guard a teardown that runs before a
+  // successful configure (would otherwise null-deref).
+  if (gps_ && gps_->isInitialized()) {
     gps_->close();
     RCLCPP_INFO(this->get_logger(), "Closed connection to %s.", device_.c_str());
   }
@@ -966,6 +1041,7 @@ void UbloxNode::shutdown() {
 
 UbloxNode::~UbloxNode() {
   shutdown();
+  closeGpioChip();
 }
 
 LifecycleNodeInterface::CallbackReturn 
@@ -993,10 +1069,6 @@ UbloxNode::on_configure(const rclcpp_lifecycle::State & state)
 
 		// Initialize Ublox
         initialize();
-
-		// Open GPIO 
-		this->open_gpio_chipname(chipname_);
-		this->open_gpio_line(line_num_);	
     }
     catch (const std::exception &e)
     {
@@ -1028,13 +1100,28 @@ UbloxNode::on_activate(const rclcpp_lifecycle::State & state)
           if (poller_->is_canceled()) 
             poller_->reset();
 
-        // Start the watchdog
-        watchdog_->start();
+        // Arm the comms-liveness watchdog: seed the freshness clock and enable
+        // the timer's staleness check (the timer itself runs continuously).
+        last_fix_time_ = std::chrono::steady_clock::now();
+        monitoring_enabled_ = true;
 
-		// Initialize the fix subscriber
+		// Initialize the fix subscriber. Subscribe to the private topic "~/fix"
+		// (the same name the firmware component publishes on) so it resolves to
+		// the node's fully-qualified name under ANY namespace. Hand-building
+		// "/" + get_name() + "/fix" dropped the namespace and broke the watchdog
+		// feed once the node is namespaced (e.g. /sensor/gnss/position).
 		fix_subscriber_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
-			std::string("/") + this->get_name() + "/fix", rclcpp::SystemDefaultsQoS(),
+			"~/fix", rclcpp::SystemDefaultsQoS(),
 			std::bind(&UbloxNode::fixCallback, this, std::placeholders::_1));
+
+		// Heading subscriber (heading nodes only).
+		if (monitor_heading_) {
+			last_heading_time_ = std::chrono::steady_clock::now();  // seed freshness clock
+
+			heading_subscriber_ = this->create_subscription<sensor_msgs::msg::Imu>(
+				"navheading", rclcpp::SystemDefaultsQoS(),
+				std::bind(&UbloxNode::headingCallback, this, std::placeholders::_1));
+		}
     }
     catch (const std::exception &e)
     {
@@ -1066,11 +1153,21 @@ UbloxNode::on_deactivate(const rclcpp_lifecycle::State & state)
         if (!poller_->is_canceled()) 
           poller_->cancel();
     
-      // Stop the watchdog
-      watchdog_->stop();
+      // Disarm the comms-liveness watchdog (timer keeps running but stops checking).
+      monitoring_enabled_ = false;
 
-      // Destroy subscriber
+      // Drop any armed retry too, so an operator-initiated deactivate sticks:
+      // otherwise the next watchdog tick reconfigures and reactivates the node
+      // underneath them and it cannot be quiesced. Safe during recovery's own
+      // cycling, because recovery() re-arms after its transitions complete
+      // rather than before. recovery_stage_ is deliberately NOT reset here -
+      // reopen() deactivates on every pass, so resetting it would stop the
+      // ladder ever escalating.
+      recovery_pending_ = false;
+
+      // Destroy subscribers
       fix_subscriber_.reset();
+      heading_subscriber_.reset();
     }
     catch (const std::exception &e)
     {
@@ -1117,9 +1214,12 @@ UbloxNode::on_cleanup(const rclcpp_lifecycle::State & state)
 		// Reset Updater pointer 
 		updater_.reset();		
 
-		// Close the GPIO
-		this->close_gpio_line();	
-		this->close_gpio_chipname();
+		// A pass that ended in INACTIVE leaves the retry armed, so an operator
+		// cleaning up from there needs it dropped as well (see on_deactivate).
+		recovery_pending_ = false;
+
+		// The GPIO chip is deliberately NOT closed here: recovery must be able
+		// to pulse the reset line from the unconfigured state.
     }
     catch (const std::exception &e)
     {
@@ -1141,9 +1241,11 @@ UbloxNode::on_shutdown(const rclcpp_lifecycle::State & state)
             state.id(),
             this->get_current_state().label().c_str(),
             this->get_current_state().id()
-        ); 
-        
-        watchdog_->stop();
+        );
+
+        // Disarm the comms-liveness watchdog and drop any armed retry.
+        monitoring_enabled_ = false;
+        recovery_pending_ = false;
 
         shutdown();
     }
@@ -1158,104 +1260,172 @@ UbloxNode::on_shutdown(const rclcpp_lifecycle::State & state)
 
 void UbloxNode::heartbeat()
 {
-    if (this->reset_fail_ || this->hard_reset_ || this->soft_reset_)
-        RCLCPP_INFO(get_logger(), "Data have been received again.");
+    if (recovery_attempts_ > 0) {
+        RCLCPP_INFO(get_logger(), "Data have been received again after %i recovery pass(es).",
+            recovery_attempts_);
+    }
 
-    if (this->reset_fail_) this->reset_fail_ = false;   // Reset reset_fail flag
-    if (this->hard_reset_) this->hard_reset_ = false;   // Reset hard_reset flag 
-    if (this->soft_reset_) this->soft_reset_ = false;   // Reset soft_reset flag 
+    // Data is flowing: drop back to the cheapest rung and restore the backoff
+    // and the shared-line pulse budget, so an unrelated later outage starts
+    // from the base interval with a full budget.
+    recovery_stage_ = RecoveryStage::kReopen;
+    recovery_attempts_ = 0;
+    gpio_pulses_ = 0;
+    next_recovery_time_ = std::chrono::steady_clock::time_point{};
+}
+
+std::chrono::seconds UbloxNode::recoveryBackoff() const
+{
+    // Double the base interval once per consecutive failed pass, capped. The
+    // shift is bounded so a prolonged outage cannot overflow the multiplier.
+    constexpr int kMaxBackoffShift = 16;
+    const int shift = std::min(recovery_attempts_, kMaxBackoffShift);
+    const int64_t interval = static_cast<int64_t>(recovery_cycle_time_) << shift;
+    return std::chrono::seconds(std::min<int64_t>(interval, recovery_backoff_max_s_));
+}
+
+void UbloxNode::watchdogCheck()
+{
+    const auto now = std::chrono::steady_clock::now();
+
+    // Backoff window. recovery() sets next_recovery_time_ after every pass, so
+    // a fault that survives the ladder cannot re-run it - and re-pulse the
+    // shared reset line - at timer rate. Cleared in heartbeat().
+    if (now < next_recovery_time_) {
+        return;
+    }
+
+    // Iterative recovery retry: a previous recovery() pass that could not reach
+    // ACTIVE re-armed this. Run the next pass here, on the executor, so retries
+    // never recurse and a prolonged outage cannot grow the call stack.
+    if (recovery_pending_) {
+        recovery_pending_ = false;
+        recovery();
+        return;
+    }
+
+    // Only guard comms liveness while active (armed across on_activate /
+    // on_deactivate). Outside the active state there is nothing to monitor.
+    if (!monitoring_enabled_) {
+        return;
+    }
+
+    // Comms loss: no ~/fix received within the timeout window. recovery() runs
+    // inline on the executor (see header note).
+    if (now - last_fix_time_ >= std::chrono::milliseconds(watchdog_timeout_)) {
+        RCLCPP_ERROR(get_logger(),
+            "Watchdog timeout! No data received from sensor for >%d ms. Recovering...",
+            watchdog_timeout_);
+        recovery();
+    }
+}
+
+void UbloxNode::reopen()
+{
+    // Guarded per transition so this is correct from ACTIVE, INACTIVE or
+    // UNCONFIGURED, and stops wherever a transition fails.
+    if (get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+        trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_DEACTIVATE);
+    }
+    if (get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
+        trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_CLEANUP);
+    }
+    if (get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED) {
+        trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_CONFIGURE);
+    }
+    if (get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
+        trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_ACTIVATE);
+    }
 }
 
 void UbloxNode::recovery()
 {
-    try 
+    try
     {
-        RCLCPP_INFO(get_logger(), "Recovery function called. Attempting to recover...");
-
-        if (this->get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE)
+        // The rungs differ only in what they do to the hardware, ordered least
+        // invasive first: a stale descriptor needs no receiver reset, and a
+        // receiver that ignores a software reset needs power cycling. Each one
+        // then ends in the same reopen().
+        switch (recovery_stage_)
         {
-            // If soft reset has not been performed, proceed with it
-            if (!this->soft_reset_ && !this->hard_reset_) 
-            {
-                RCLCPP_INFO(get_logger(), "Proceeding to soft reset.");
-                this->soft_reset_ = true; // Set soft reset flag
+        case RecoveryStage::kReopen:
+            RCLCPP_INFO(get_logger(),
+                "Recovery: reopening the connection; the receiver is left untouched.");
+            break;
+
+        case RecoveryStage::kDeviceReset:
+            RCLCPP_WARN(get_logger(),
+                "Recovery: reopening did not restore data; resetting the receiver (UBX CFG-RST, hot start).");
+            // Hot start keeps the battery-backed data, so re-acquisition is fast.
+            // gps_ is null if a previous pass left the node unconfigured; the
+            // reopen below is then the whole rung.
+            if (this->gps_) {
+                this->gps_->configReset(ublox_msgs::msg::CfgRST::NAV_BBR_HOT_START,
+                                        ublox_msgs::msg::CfgRST::RESET_MODE_SW);
             }
-            // Else proceed with hard reset
-            else if (this->soft_reset_ && !this->hard_reset_) 
+            break;
+
+        case RecoveryStage::kHardwareReset:
+            RCLCPP_WARN(get_logger(),
+                "Recovery: the receiver did not come back from a software reset; power-cycling it over the shared reset line.");
+            // Wait out the reset before reopening, or on_configure would reach
+            // for a port whose device is still held down. A peer pulse needs the
+            // longer wait because its assert phase has not been accounted for
+            // here, unlike our own pulse which already blocked for it.
+            switch (this->tryResetGpioLine())
             {
-                RCLCPP_INFO(get_logger(), "Soft reset already performed, proceeding to hard reset.");
-                this->hard_reset_ = true; // Set hard reset flag
+            case ResetPulse::kIssued:
+                rclcpp::sleep_for(std::chrono::seconds(this->recovery_cycle_time_));
+                break;
+            case ResetPulse::kPeerDriving:
+                rclcpp::sleep_for(
+                    std::chrono::seconds(this->gpio_reset_time_ + this->recovery_cycle_time_));
+                break;
+            case ResetPulse::kSkipped:
+                break;
             }
-			// Check if both soft and hard reset have already been performed
-			else if (this->hard_reset_ && this->soft_reset_)   
-			{
-				if (!this->reset_fail_) this->reset_fail_ = true; 
-
-				RCLCPP_WARN(get_logger(), "Both soft and hard resets have already been performed. Resetting GPIO and waiting for %i seconds before retrying.", this->recovery_cycle_time_);
-				
-				// Reset GPIO
-				this->set_gpio_toggle(false);
-				rclcpp::sleep_for(std::chrono::seconds(this->gpio_reset_time_));
-				this->set_gpio_toggle(true);
-				
-				// Wait before retrying recovery
-				rclcpp::sleep_for(std::chrono::seconds(this->recovery_cycle_time_));
-			}        
-
-            // Deactivate the node
-			if (this->get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE)
-            	this->trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_DEACTIVATE);
-
-            // Hard reset
-            if (this->hard_reset_) {
-                // Cleanup the node
-				if (this->get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE)
-                	this->trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_CLEANUP);
-
-                // Configure the node again
-				if (this->get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED)
-                	this->trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_CONFIGURE);
-			} 
-
-            // Activate the node again
-			if (this->get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE)
-            	this->trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_ACTIVATE);
+            break;
         }
-		else
-		{
-			RCLCPP_ERROR(get_logger(), "Recovery called while node is not active (current state: %s). Attempting to activate...", this->get_current_state().label().c_str());
 
-			if (this->get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED)
-				this->trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_CONFIGURE);
-				
-			if (this->get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE)
-				this->trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_ACTIVATE);
-		}
+        // Every rung ends here: this is the only path that reopens the port.
+        reopen();
 
-		// Check if the node is active after recovery
-		if (this->get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE)
-			RCLCPP_INFO(get_logger(), "Recovery successful.");
-		else
-		{
-			RCLCPP_ERROR(get_logger(), "Recovery failed, node is not active (current state: %s). Waiting for %i seconds before retrying.", this->get_current_state().label().c_str(), this->recovery_cycle_time_);
-			
-			// Reset GPIO
-			RCLCPP_INFO(get_logger(), "Resetting GPIO and waiting for %i seconds before retrying recovery.", this->gpio_reset_time_);
-			this->set_gpio_toggle(false);
-			rclcpp::sleep_for(std::chrono::seconds(this->gpio_reset_time_));
-			this->set_gpio_toggle(true);
+        if (this->get_current_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+            RCLCPP_INFO(get_logger(), "Recovery pass completed; node is active.");
+        } else {
+            RCLCPP_ERROR(get_logger(), "Recovery pass failed; node is %s.",
+                this->get_current_state().label().c_str());
+        }
 
-			rclcpp::sleep_for(std::chrono::seconds(this->recovery_cycle_time_));
-			this->recovery();
-		}
+        // Escalate for the next pass. kHardwareReset is the last rung and
+        // repeats; its pulse budget, not the ladder, bounds the resets.
+        if (recovery_stage_ == RecoveryStage::kReopen) {
+            recovery_stage_ = RecoveryStage::kDeviceReset;
+        } else if (recovery_stage_ == RecoveryStage::kDeviceReset) {
+            recovery_stage_ = RecoveryStage::kHardwareReset;
+        }
     }
     catch (const std::exception &e)
     {
         RCLCPP_ERROR(get_logger(), "Recovery failed: %s", e.what());
     }
+
+    // Pace the next pass. The backoff applies whether or not this pass reached
+    // ACTIVE, so a receiver that reactivates but never delivers data cannot
+    // re-run the ladder every watchdog timeout.
+    const auto backoff = recoveryBackoff();
+    ++recovery_attempts_;
+    next_recovery_time_ = std::chrono::steady_clock::now() + backoff;
+
+    // Re-arm (not recurse): the next pass runs on the executor via watchdog_timer_.
+    if (this->get_current_state().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+        this->recovery_pending_ = true;
+        RCLCPP_INFO(get_logger(), "Next recovery attempt in %li s (pass %i).",
+            static_cast<long>(backoff.count()), this->recovery_attempts_);
+    }
 }
 
-void UbloxNode::open_gpio_chipname(const std::string &chipname)
+void UbloxNode::openGpioChip(const std::string &chipname)
  {
     try 
     {
@@ -1273,7 +1443,7 @@ void UbloxNode::open_gpio_chipname(const std::string &chipname)
     }
 }
 
-void UbloxNode::close_gpio_chipname()
+void UbloxNode::closeGpioChip()
 {
 	try
 	{
@@ -1286,66 +1456,72 @@ void UbloxNode::close_gpio_chipname()
 	}
 }
 
-void UbloxNode::open_gpio_line(unsigned int line_num)
+UbloxNode::ResetPulse UbloxNode::tryResetGpioLine()
 {
-	try 
-	{
-		line_num_ = line_num;
-
-		// Get the specific GPIO line number (relative to the chip)
-        gpiod::line tmp = chip_.get_line(line_num_);
-		line_ = std::move(tmp);
-
-		if (line_.is_used() && !line_.is_requested()) {
-			RCLCPP_WARN(get_logger(), "GPIO line %u is in use by another consumer.", line_num);
-			return;
-		}
-		// Request the line as an output, setting the initial value to HIGH or LOW
-		if (!line_.is_requested()) {
-			line_.request({"gpio_reset", gpiod::line_request::DIRECTION_OUTPUT, 0}, true);
-		} else {
-			line_.set_value(true);
-		}
-		
-		RCLCPP_INFO(get_logger(), "GPIO chip %s line %u (output) initialized.", chipname_.c_str(), line_num_);
-	} 
-	catch (const std::exception& e) 
-	{
-		RCLCPP_ERROR(get_logger(),"GPIO (chipname %s, line %u) initialization error: %s", chipname_.c_str(), line_num_, e.what());
+	// The line resets BOTH receivers. Once the budget is spent this node keeps
+	// retrying the reopen but stops pulsing, so a receiver that cannot be
+	// recovered does not hold the healthy one in reset indefinitely.
+	if (gpio_pulses_ >= recovery_gpio_pulse_limit_) {
+		RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+			"Shared GPIO reset budget spent (%i consecutive pulses); not pulsing again until data returns. The line resets both receivers.",
+			recovery_gpio_pulse_limit_);
+		return ResetPulse::kSkipped;
 	}
+
+	const ResetPulse outcome = this->resetGpioLine();
+
+	// A peer pulse resets this node's receiver exactly as our own does, so it
+	// spends budget too; otherwise two nodes taking turns would never exhaust it.
+	if (outcome != ResetPulse::kSkipped) {
+		++gpio_pulses_;
+		RCLCPP_INFO(get_logger(), "Shared GPIO reset %i/%i since data was last received.",
+			gpio_pulses_, recovery_gpio_pulse_limit_);
+	}
+
+	return outcome;
 }
 
-void UbloxNode::close_gpio_line()
+UbloxNode::ResetPulse UbloxNode::resetGpioLine()
 {
 	try
 	{
-		if (line_.is_requested()) {
-			line_.release();
-			line_.reset();
-			RCLCPP_INFO(get_logger(), "GPIO chip %s line %u released.", chipname_.c_str(), line_num_);
-		} else {
-			RCLCPP_WARN(get_logger(), "GPIO chip %s line %u is not requested.", chipname_.c_str(), line_num_);
+		gpiod::line line = chip_.get_line(line_num_);
+
+		// The F9P and F9H drivers are separate processes sharing this line, and
+		// only one may drive it at a time. A line already held is therefore not
+		// contention to resolve but work the peer is doing on our behalf: its
+		// pulse resets both receivers. Match on the consumer name so a third
+		// party holding the line is not mistaken for the peer.
+		if (line.is_used()) {
+			const std::string consumer = line.consumer();
+			if (consumer == kResetConsumer) {
+				RCLCPP_INFO(get_logger(), "GPIO chip %s line %u is being pulsed by the other GNSS node; that reset covers this receiver too.", chipname_.c_str(), line_num_);
+				return ResetPulse::kPeerDriving;
+			}
+			RCLCPP_ERROR(get_logger(), "GPIO chip %s line %u is held by '%s', which is not the GNSS reset; skipping.", chipname_.c_str(), line_num_, consumer.c_str());
+			return ResetPulse::kSkipped;
 		}
-	} 
-	catch (const std::exception& e) 
-	{
-		RCLCPP_ERROR(get_logger(),"GPIO (chipname %s, line %u) release error: %s", chipname_.c_str(), line_num_, e.what());
+
+		// Pulse: LOW (assert) for gpio_reset_time_ s, then HIGH (deassert);
+		// release. Requesting with a default of 1 keeps the line deasserted
+		// between the request and the deliberate assert below.
+		line.request({kResetConsumer, gpiod::line_request::DIRECTION_OUTPUT, 0}, 1);
+		line.set_value(0);
+		rclcpp::sleep_for(std::chrono::seconds(this->gpio_reset_time_));
+		line.set_value(1);
+		line.release();
+
+		RCLCPP_INFO(get_logger(), "GPIO chip %s line %u reset pulse completed.", chipname_.c_str(), line_num_);
+		return ResetPulse::kIssued;
 	}
-}
-
-void UbloxNode::set_gpio_toggle(bool high) 
-{
-    try 
-    {
-        // Set the GPIO line to the desired value (again, HIGH or LOW)
-        line_.set_value(high);
-
-        RCLCPP_INFO(get_logger(), "GPIO chip %s line %u (output) set to %s.", chipname_.c_str(), line_num_, high ? "HIGH" : "LOW");
-    } 
-    catch (const std::exception& e) 
-    {
-        RCLCPP_ERROR(get_logger(),"GPIO (chipname %s, line %u, value %s) error: %s", chipname_.c_str(), line_num_, high ? "HIGH" : "LOW", e.what());
-    }
+	catch (const std::exception& e)
+	{
+		// Losing the request race with the peer lands here (EBUSY). Reported as
+		// skipped rather than assumed to be a peer pulse: the reopen then fails
+		// and the backoff retries, which is safe either way.
+		RCLCPP_WARN(get_logger(),"GPIO (chipname %s, line %u) reset error: %s", chipname_.c_str(), line_num_, e.what());
+		return ResetPulse::kSkipped;
+	}
 }
 
 }  // namespace ublox_node

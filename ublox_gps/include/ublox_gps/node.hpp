@@ -31,6 +31,7 @@
 #define UBLOX_GPS_NODE_HPP
 
 // STL
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -56,8 +57,9 @@
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include "lifecycle_msgs/msg/transition_description.hpp"
 
-// Watchdog
-#include "ublox_gps/watchdog.hpp"
+// Comms-liveness watchdog. The former separate Watchdog thread
+// (ublox_gps/watchdog.hpp) has been replaced by a single wall timer on the
+// node's executor; the header is kept only as legacy/unused.
 
 // GPIO
 #include <gpiod.hpp>
@@ -65,6 +67,7 @@
 // Debugging: service to enable/disable gps inputs
 #include <std_srvs/srv/set_bool.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 
 // This file also declares UbloxNode which is the main class and ros node. It
 // implements functionality which applies to any u-blox device, regardless of
@@ -114,6 +117,9 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
   const double kFixFreqWindow = 10;
   //! Minimum Time Stamp Status for fix frequency diagnostic
   const double kTimeStampStatusMin = 0;
+  //! Orientation covariance the producer leaves when the heading is invalid
+  //! (hp_pos_rec_product.cpp); values >= this mean "no valid heading".
+  constexpr static double kInvalidHeadingCovariance = 1000.0;
 
   /**
    * @brief Initialize and run the u-blox node.
@@ -176,10 +182,11 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
   void initialize();
 
   /**
-   * @brief Shutdown the node. Closes the serial port.
+   * @brief Close the serial port. Hides LifecycleNode::shutdown() (the
+   * transition); qualify the base name to trigger the transition.
    */
   void shutdown();
-  void shutdown2();
+  
   /**
    * @brief Send a reset message the u-blox device & re-initialize the I/O.
    * @return true if reset was successful, false otherwise.
@@ -359,10 +366,25 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
    * @param msg The NavSatFix message.
    */
   void fixCallback(const sensor_msgs::msg::NavSatFix::SharedPtr msg);
-  
+
   // Subscriber for node /ublox_gps_rover_node/fix of type sensor_msgs/msg/NavSatFix
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr fix_subscriber_;
-  
+
+  /**
+   * @brief Callback for the heading (Imu) message; surfaces heading loss.
+   * @param msg The Imu heading message.
+   */
+  void headingCallback(const sensor_msgs::msg::Imu::SharedPtr msg);
+
+  // Subscriber for the node's own navheading topic (heading nodes only)
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr heading_subscriber_;
+
+  // Whether this node produces (and therefore monitors) a heading solution
+  bool monitor_heading_ = false;
+
+  // Arrival time of the last valid heading; used by the freshness guard.
+  std::chrono::steady_clock::time_point last_heading_time_;
+
   /* **** */
   /* GPIO */
   /* **** */
@@ -371,32 +393,39 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
    * @brief Set the GPIO chipname.
    * @param chipname the GPIO chipname
    */
-  void open_gpio_chipname(const std::string& chipname);
+  void openGpioChip(const std::string& chipname);
   
   /**
    * @brief Close the GPIO chipname.
    */
-  void close_gpio_chipname();
+  void closeGpioChip();
+
+  //! Outcome of an attempt to drive the shared reset line. The F9P and F9H
+  //! nodes are separate processes sharing one line, so "someone else is
+  //! pulsing" is a normal outcome, not an error: the line resets both
+  //! receivers, so the peer's pulse covers this one too.
+  enum class ResetPulse : uint8_t {
+    kIssued,        //!< this node drove the line
+    kPeerDriving,   //!< the other GNSS node holds it; its pulse resets both
+    kSkipped        //!< budget spent, line owned by a third party, or it failed
+  };
 
   /**
-   * @brief Set the GPIO line number.
-   * @param line_num the GPIO line number
+   * @brief Pulse the GPIO reset line (LOW for gpio_reset_time_ s, then HIGH).
+   * The line is requested only for the pulse and released immediately.
    */
-  void open_gpio_line(unsigned int line);
+  ResetPulse resetGpioLine();
 
   /**
-   * @brief Close the GPIO line.
+   * @brief Pulse the reset line unless the consecutive-pulse budget is spent.
+   * The line is shared with the other GNSS node and resets BOTH receivers, so a
+   * node that cannot recover must stop pulsing rather than hold the healthy
+   * receiver down. A peer pulse counts against the budget too, because it
+   * resets this node's receiver just the same. Cleared in heartbeat().
    */
-  void close_gpio_line();
-  
-  /**
-   * @brief GPIO set HIGH or LOW.
-   * @return True is success, False otherwise.
-   */
-  void set_gpio_toggle(bool high);
-  
+  ResetPulse tryResetGpioLine();
+
   gpiod::chip chip_;                    // GPIO chip
-  gpiod::line line_;                    // GPIO line
   std::string chipname_;                // GPIO chipname
   unsigned int line_num_;               // GPIO line number
   int gpio_reset_time_;                 // GPIO reset time in seconds
@@ -410,20 +439,69 @@ class UbloxNode final : public rclcpp_lifecycle::LifecycleNode {
    */
   void recovery();
 
-  /** 
+  /**
+   * @brief Cycle the node down to UNCONFIGURED and back up to ACTIVE.
+   *
+   * @details on_configure() -> initialize() -> initializeIo() is the only path
+   * that opens the serial port, so a recovery that does not pass through
+   * UNCONFIGURED cannot replace a stale connection. Every recovery rung
+   * therefore ends here; the rungs differ only in what they do to the hardware
+   * first. Each transition is guarded on the current state, so this is correct
+   * from ACTIVE, INACTIVE or UNCONFIGURED and stops where a transition fails.
+   */
+  void reopen();
+
+  /**
+   * @brief Watchdog tick (runs on the executor via watchdog_timer_).
+   * Triggers recovery() on comms loss (no ~/fix within watchdog_timeout_ while
+   * monitoring is enabled) and drives the iterative recovery retry.
+   */
+  void watchdogCheck();
+
+  /**
    * @brief Callback for the Heartbeat function.
    */
   void heartbeat();
 
-  bool soft_reset_ = false;               // Flag to indicate if a soft reset is needed (deactivation only)
-  bool hard_reset_ = false;               // Flag to indicate if a hard reset is needed (deactivation + cleanup)
-  bool reset_fail_ = false;               // Flag to indicate if both reset failed
-  int recovery_cycle_time_;               // Recovery cycle time in seconds
+  /**
+   * @brief Delay before the next recovery pass: recovery_cycle_time_ doubled
+   * once per consecutive failed pass, capped at recovery_backoff_max_s_.
+   */
+  std::chrono::seconds recoveryBackoff() const;
 
-  // Watchdog
-  std::shared_ptr<Watchdog> watchdog_;    // Watchdog 
-  int watchdog_timeout_;                  // Watchdog timeout in milliseconds
-  int watchdog_cycle_time_;               // Watchdog cycle time in milliseconds
+  //! Escalation rung for the next recovery pass, ordered by how invasive it is
+  //! toward the hardware. Every rung ends in reopen(); they differ only in what
+  //! they do to the receiver first. Advances once per pass, and drops back to
+  //! kReopen in heartbeat() when data returns.
+  enum class RecoveryStage : uint8_t {
+    kReopen,        //!< host side only: cycle the node, receiver untouched
+    kDeviceReset,   //!< UBX CFG-RST hot start, then reopen
+    kHardwareReset  //!< pulse the shared reset line, then reopen (last rung)
+  };
+
+  RecoveryStage recovery_stage_ = RecoveryStage::kReopen;
+  int recovery_cycle_time_;               // Base retry interval in seconds
+  int recovery_backoff_max_s_;            // Ceiling for the doubling retry interval [s]
+  int recovery_gpio_pulse_limit_;         // Max consecutive pulses of the shared reset line
+  int recovery_attempts_ = 0;             // Consecutive recovery passes since data last arrived
+  int gpio_pulses_ = 0;                   // Consecutive reset pulses since data last arrived
+
+  // Earliest time the next recovery pass may run. Set after every pass so a
+  // persistent fault paces the ladder instead of re-running it at timer rate;
+  // cleared in heartbeat() when data returns.
+  std::chrono::steady_clock::time_point next_recovery_time_;
+
+  // Comms-liveness watchdog as a single wall timer on the node's executor.
+  // Because it runs on the executor, recovery() is invoked inline and never
+  // races the executor's own callbacks or lifecycle transitions, so no
+  // cross-thread atomics are required. All members below are touched only on the
+  // executor thread.
+  rclcpp::TimerBase::SharedPtr watchdog_timer_;
+  std::chrono::steady_clock::time_point last_fix_time_;  // arrival of the last ~/fix
+  bool monitoring_enabled_ = false;       // comms guard armed (active state only)
+  bool recovery_pending_ = false;         // re-arm for the next iterative retry
+  int watchdog_timeout_;                  // Comms-loss timeout in milliseconds
+  int watchdog_cycle_time_;               // Watchdog check interval in milliseconds
 
   /* ********* */
   /* Debugging */

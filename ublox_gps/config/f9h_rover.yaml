@@ -1,7 +1,7 @@
 # Configuration Settings for C94-M8P device
 ublox_gps_rover_node:
   ros__parameters:
-    debug: 4                    # Range 0-4 (0 means no debug statements will print)
+    debug: 0                    # Range 0-4 (0 means no debug statements will print)
 
     device: /dev/serial/by-id/usb-u-blox_AG_-_www.u-blox.com_u-blox_GNSS_receiver_F9H-if00
     frame_id: gps_rover
@@ -17,16 +17,16 @@ ublox_gps_rover_node:
     gpio:
       chipname: "gpiochip0"
       line_num: 134
-      reset_time: 1
+      reset_time_s: 1
     
     # Recovery configuration
     recovery:
-      cycle_time: 1
+      cycle_time_s: 1
     
     # Watchdog configuration
     watchdog:
-      timeout: 3000
-      cycle_time: 500
+      timeout_ms: 3000
+      cycle_time_ms: 500
 
     # Enable u-blox message publishers
     publish:

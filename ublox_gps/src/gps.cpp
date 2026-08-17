@@ -581,6 +581,16 @@ bool Gps::setUseAdr(bool enable) {
 }
 
 bool Gps::sendRtcm(const std::vector<uint8_t>& rtcm) {
+  // Same guard as poll() and configure(). A Gps object exists from the moment
+  // on_configure() constructs it, but worker_ is only set once the port opens,
+  // so a configure that failed on a missing device leaves a live Gps with no
+  // worker. Corrections keep arriving on /rtcm throughout - that subscription
+  // outlives the lifecycle transitions - and dereferencing worker_ there
+  // segfaults the process, taking the recovery ladder with it.
+  if (!worker_) {
+    return false;
+  }
+
   worker_->send(rtcm.data(), rtcm.size());
   return true;
 }

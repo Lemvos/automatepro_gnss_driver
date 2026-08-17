@@ -201,6 +201,44 @@ To publish a given u-blox message to a ROS topic, set the parameter shown below 
 A sample launch file `ublox_device.launch` loads the parameters from a `.yaml` file in the `ublox_gps/config` folder, sample configuration files are included. The required arguments are `node_name` and `param_file_name`.
 The two topics to which you should subscribe are `~fix` and `~fix_velocity`. The angular component of `fix_velocity` is unused.
 
+## Running without root (serial-port permissions)
+
+The node only needs access to the GNSS serial device (`/dev/ttyACM*`, owned by group `dialout`) and the GPIO reset chip (`/dev/gpiochip0`, group `gpio`); it does **not** need to run as `root`. Grant the service user the `dialout` group (most systems already grant `gpio`):
+
+```bash
+sudo usermod -aG dialout <user>   # -a appends; without it, -G REPLACES the user's groups
+```
+
+Re-login or restart the service for the membership to take effect. In a systemd unit, set `User=<user>` and `Group=<user>`; systemd applies the user's supplementary groups automatically. As a bonus, running as a normal user makes the node's FastDDS shared-memory segments readable by same-user CLI tools (`ros2 topic echo|hz`), which otherwise show no data for root-owned publishers.
+
+## Moving-baseline heading configuration (`scripts/`)
+
+The moving-baseline heading is computed **on the receivers**, not in ROS. The F9P (moving base) must stream, over its UART2 to the F9H (rover), the reference position (RTCM **4072.0** + 4072.1) **and** the base observations (RTCM **MSM4**: 1074/1084/1094/1124); the F9H must accept RTCM3 on its UART and output `UBX-NAV-RELPOSNED`. If any of those are missing the rover reports `NAV-RELPOSNED` with `flags = 1` (only `GNSS_FIX_OK`; no `DIFF_SOLN`/`REL_POS_VALID`/`REL_POS_HEAD_VALID`), so `~/navheading` stays at a placeholder heading with covariance 1000 and the driver logs "GNSS heading not valid". This is device configuration, independent of this driver and of any NTRIP/SPARTN correction stream (NTRIP corrects absolute position; it is not needed for heading). See the [u-blox Moving Base Application Note (UBX-19009093)](https://content.u-blox.com/sites/default/files/documents/ZED-F9P-MovingBase_AppNote_UBX-19009093.pdf).
+
+Two helper scripts inspect and provision this without u-center. They talk UBX over the serial ports, so they need [`pyubx2`](https://pypi.org/project/pyubx2/) and the ports **free** (stop the GNSS process/container first):
+
+```bash
+sudo python3 -m pip install pyubx2      # one-time; sudo because the scripts run as root for /dev/ttyACM*
+
+# stop whatever owns the receivers' ports (the scripts open them by stable
+# by-id path, so they always hit the right module even if ttyACM* renumbers):
+docker stop automatepro-core-driver     # or: sudo systemctl stop <gnss-service>
+
+# read the current config of both receivers (RAM + FLASH), non-destructive:
+sudo python3 scripts/gnss_config_probe.py          # curated moving-base keys
+
+# provision both receivers to the known-good moving-base config and save to flash:
+sudo python3 scripts/gnss_apply_default.py         # dry-run preview
+sudo python3 scripts/gnss_apply_default.py --apply # write (expect ACK-ACK)
+sudo python3 scripts/gnss_config_probe.py          # verify
+
+docker start automatepro-core-driver
+```
+
+`gnss_apply_default.py` writes the verified-good set to RAM + BBR + **FLASH** (so it survives resets): on the F9P it enables `4072.0`/`4072.1` + MSM4 (`1074/1084/1094/1124`) on UART2 (and disables MSM7/1230 to match) and sets `UART2OUTPROT_RTCM3X`; on the F9H it enables `UART1/2 INPROT_RTCM3X` and `NAV-RELPOSNED` output. It does **not** change UART2 baud by default; pass `--uart2-baud 115200` to also set the link baud on **both** modules (they must match — see [docs/gnss-movingbase-config.md](docs/gnss-movingbase-config.md)). After applying, allow 30–60 s for the rover to fix the baseline, then `flags` on `NAV-RELPOSNED` should show `DIFF_SOLN | REL_POS_VALID | REL_POS_HEAD_VALID`. Edit the `DEVICES` table in the script to capture a different known-good profile.
+
+The verified-good profile, the as-found vs known-good captures, and a per-key explanation of every change are documented in [docs/gnss-movingbase-config.md](docs/gnss-movingbase-config.md).
+
 # Version history
 
 * **1.1.4**:
@@ -356,6 +394,15 @@ Currently there are implementations of `ComponentInterface` for firmware version
 
 `UbloxFirmware7` has not been properly tested on a device with firmware version 7. `UbloxFirmware6` has been tested on a device with firmware version 8, but not with firmware version 6.
 
+## GNSS integrity limitations (recovery scope)
+
+These are known, intentional limitations of the watchdog/recovery system. Consumers that depend on GNSS integrity (navigation, unattended operation) must account for them at a higher level — they are **not** handled by the driver's automatic recovery.
+
+- **RTK / carrier-solution quality is not part of recovery.** The watchdog and recovery only act on **communication loss** (no messages from the receiver). RTK degradation (fixed → float → none) and loss of RTCM correction input are **not** monitored for recovery and will **not** trigger a reset. RTK state is surfaced only via (a) `NavSatFix.status` on `~/fix` (`STATUS_GBAS_FIX` only when carrier-phase *fixed*; float and single map to `STATUS_FIX`), (b) the *Carrier Phase Solution* `/diagnostics` task, and (c) the `rxmrtcm` rate diagnostic. A consumer that requires cm-level RTK must gate on `NavSatFix.status` / `/diagnostics`. RTCM correction freshness is not timed out.
+- **Recovery is gated on comms loss, not fix loss.** A receiver that keeps streaming but never gets a valid fix (e.g. antenna fault, sustained obstruction) keeps the comms watchdog satisfied and is **not** reset. This is deliberate: the watchdog timeout (seconds) is far shorter than GNSS re-acquisition time, so resetting on no-fix would loop and *prevent* a fix. Loss of a valid fix is surfaced via `NavSatFix.status` (`STATUS_NO_FIX`), the fix `/diagnostics` task, and a throttled node log; downstream/safety logic must act on those.
+- **Heading quality is surfaced, not recovered.** Loss of a valid moving-baseline heading is reported via the heading `Imu` `orientation_covariance` (large/`1000` when invalid) and a throttled node log, but does not trigger recovery (same re-acquisition reasoning, and a reset cannot restore corrections). A heading stream that *stops* while the position stream is still alive (the heading consumer would otherwise hold a stale last-known heading) is also surfaced via a throttled node log: heading freshness is checked on each `~/fix` message against the comms-freshness window (`watchdog.timeout_ms`).
+- **Message timestamps reflect publish time, not fix validity.** `header.stamp` on `~/fix`/`navheading` is set to the receiver time when valid and otherwise to the current ROS time, and is stamped on every message regardless of fix validity. A "recent" timestamp therefore does **not** by itself imply a valid or fresh fix — consumers must check `NavSatFix.status` / heading covariance for validity, not only the timestamp. There is no detection of a frozen/repeated solution.
+
 ## Debugging
 
 For debugging messages set the debug parameter to > 0. The range for debug is 0-4. At level 1 it prints configuration messages and checksum errors, at level 2 it also prints ACK/NACK messages and sent messages. At level 3 it prints the received bytes being decoded by a specific message reader. At level 4 it prints the incoming buffer before it is split by message header.
@@ -372,21 +419,59 @@ Consult the [official protocol spec](https://www.u-blox.com/sites/default/files/
 
 The `UbloxNode` class is implemented as a ROS 2 Lifecycle Node, providing robust state management and controlled transitions for the GNSS driver. The lifecycle logic is structured around the standard ROS 2 lifecycle states: unconfigured, inactive, active, and finalized. Key lifecycle transitions (`on_configure`, `on_activate`, `on_deactivate`, `on_cleanup`, and `on_shutdown`) are overridden to manage resource allocation, initialization, activation, and cleanup of the GNSS device and related subsystems.
 
-- **on_configure**: Initializes the GNSS device, diagnostic updater, GNSS and GPS interfaces, and sets up GPIO resources. 
-- **on_activate**: Starts periodic timers for polling and keep-alive, activates the watchdog, and subscribes to the NavSatFix topic for fix updates.
-- **on_deactivate**: Stops timers, disables the watchdog, and cleans up subscriptions.
-- **on_cleanup**: Releases all resources, including timers, publishers, GNSS/GPS objects, and GPIO lines.
-- **on_shutdown**: Ensures all resources are closed and the watchdog is stopped.
+- **on_configure**: Initializes the GNSS device, diagnostic updater, and the GNSS and GPS interfaces. 
+- **on_activate**: Starts periodic timers for polling and keep-alive, subscribes to `~/fix`, and **arms** the comms-liveness watchdog (seeds the freshness clock, sets `monitoring_enabled_`).
+- **on_deactivate**: Stops timers, **disarms** the watchdog (the timer keeps running but stops checking), and cleans up subscriptions.
+- **on_cleanup**: Releases all resources, including timers, publishers, and the GNSS/GPS objects. The GPIO chip handle is deliberately kept (see *Shared GPIO reset line*).
+- **on_shutdown**: Disarms the watchdog and ensures all resources are closed.
 
 This design ensures that the node can be safely reconfigured, restarted, or shut down, with all hardware and software resources managed according to the node's state.
 
+## Bring-up and shutdown (`node_main.cpp`)
+
+- **Signal handling is async-signal-safe.** `rclcpp` signal handlers are disabled (`SignalHandlerOptions::None`) so `main` drives teardown and the context stays valid. The handler only does `g_stop.exchange(true)`; the first signal requests a graceful stop, a second forces `std::_Exit(1)` as an escape hatch if teardown hangs. A watcher thread observes `g_stop` and cancels the spin, waiting for `is_spinning()` first to avoid a cancel-before-spin race.
+- **Transitions are checked, not assumed.** Bring-up verifies `configure() → INACTIVE` and `activate() → ACTIVE`; a stop requested during bring-up skips `activate()`. The teardown ladder (`deactivate` → `cleanup` → `shutdown`) checks each resulting state and logs when a fail-safe step did not run. The node is destroyed before `rclcpp::shutdown()` on every exit path.
+- **`shutdown()` name collision.** `UbloxNode::shutdown()` (closes the serial port; called from `on_shutdown()` and the destructor) hides the inherited `LifecycleNode::shutdown()` transition. Callers that want the *transition* must qualify it: `node->rclcpp_lifecycle::LifecycleNode::shutdown()`.
+- **Fail-safe teardown without a device.** `UbloxNode::shutdown()` guards `gps_` (created only in `on_configure()`), so tearing down a node that never configured — for example because configure failed on a missing device — does not null-deref.
+
 # Recovery System Overview
 
-The node implements an integrated recovery system to handle communication failures or hardware issues. A watchdog timer monitors data reception from the GNSS device. If no data is received within the configured timeout, the watchdog triggers the recovery logic.
+The node implements an integrated recovery system to handle communication failures or hardware issues. A watchdog monitors **data reception** from the GNSS device (the arrival time of the last `~/fix` is recorded on every message). If no message is received within the configured timeout, recovery is triggered. Recovery targets **communication loss**, not loss of fix/RTK quality — see *GNSS integrity limitations* above.
 
-The recovery process is state-aware and escalates through several steps:
-1. **Soft Reset**: If the node is active and no prior reset has occurred, a soft reset is performed by deactivating and reactivating the node.
-2. **Hard Reset**: If a soft reset has already been performed, a hard reset is executed by deactivating and cleaning up the node, then reconfiguring and activating it.
-3. **GPIO Reset and Wait**: If both soft and hard resets have been attempted, the system toggles the GPIO line to reset the hardware, waits for a configurable period, and retries recovery.
+The watchdog is a single wall timer (`watchdog_timer_`, created in the constructor so it survives lifecycle transitions) on the node's single-threaded executor. Each tick — every `watchdog.cycle_time_ms` ms — `watchdogCheck()` compares the time since the last `~/fix` (`last_fix_time_`) against `watchdog.timeout_ms` while monitoring is armed (`monitoring_enabled_`, set across `on_activate` / `on_deactivate`) and, on comms loss, runs `recovery()` **inline on the executor**. Because detection and recovery share the executor thread, lifecycle transitions and the teardown of the `gps_`/`updater_` objects never race the executor's own callbacks, and no cross-thread atomics are needed. This replaced an earlier dedicated `Watchdog` thread (`watchdog.hpp`, retained in tree but legacy and unused) that bridged into the executor via an atomic flag and a second timer.
 
-After each recovery attempt, the node checks its state and, if not active, continues retrying with GPIO resets and delays until successful. 
+The freshness clock advances on **message arrival**, not on a *valid* fix — see *GNSS integrity limitations* above for why gating recovery on fix validity would produce a reset loop that prevents a fix.
+
+Recovery escalates through three rungs, ordered by how invasive each is toward the hardware. Every rung ends in the **same** reopen — `reopen()`, which cycles the node `deactivate → cleanup → configure → activate` — because `on_configure` → `initialize()` → `initializeIo()` is the *only* path that opens the serial port. The rungs differ solely in what they do to the receiver first:
+
+1. **Reopen** (`kReopen`): the receiver is left untouched. This clears host-side faults — a stale file descriptor, a dead I/O worker thread, a device node that re-enumerated — without rebooting a receiver that was never at fault.
+2. **Device reset** (`kDeviceReset`): reopening did not restore data, so the receiver itself is reset with a u-blox **UBX-CFG-RST controlled software reset** (hot start, so battery-backed data is kept and re-acquisition is fast), then reopened.
+3. **Hardware reset** (`kHardwareReset`): the receiver did not come back from a software reset, so the shared GPIO line is pulsed to power-cycle it, the node waits out the reset, then reopens. This is the last rung and repeats; its **pulse budget**, not the ladder, is what bounds the resets.
+
+`recovery_stage_` advances one rung per pass and drops back to `kReopen` in `heartbeat()` as soon as a message arrives. Note the ordering matters for the shared reset line: when the peer node pulses, this receiver is reset too, and this node then starts at rung 1 — a plain reopen, which is exactly the right response to a receiver someone else just rebooted.
+
+After each recovery attempt the node checks its state and, if not active, re-arms the retry (`recovery_pending_`) so the next pass runs on a later watchdog tick. Retries are **iterative**, not recursive, so a prolonged outage cannot grow the call stack.
+
+### Backoff and the shared-line pulse budget
+
+A fault that survives the whole ladder must not spin it. Two bounds apply, both cleared by `heartbeat()` the moment a message arrives again:
+
+- **Exponential backoff.** After *every* pass, `next_recovery_time_` is set to `recovery.cycle_time_s` doubled once per consecutive pass, capped at `recovery.backoff_max_s` (1 s → 2 → 4 … → 60 s by default). `watchdogCheck()` returns early inside that window. The backoff applies whether or not the pass reached ACTIVE, so a receiver that reactivates but never delivers data cannot re-run the ladder every watchdog timeout. The wait is a deadline check on the timer, not a blocking sleep, so the executor stays responsive between passes.
+- **Pulse budget.** `tryResetGpioLine()` issues at most `recovery.gpio_pulse_limit` consecutive pulses (default 3). Past that the node keeps reopening but stops touching the line. This matters because the line is shared: without the cap, an F9H that is permanently dead would reset the healthy F9P every cycle forever. A pulse the *peer* issued spends this node's budget too — otherwise two nodes taking turns would never exhaust it.
+
+## Shared GPIO reset line
+
+Both GNSS nodes share one hardware reset line (`gpio.chipname` / `gpio.line_num`), so a pulse resets **both** receivers. `resetGpioLine()` requests the line only for the duration of the pulse — LOW to assert for `gpio.reset_time_s` s, then HIGH to deassert — and releases it immediately, so the line is never held across the node's lifetime; the board pull-up holds it deasserted between pulses.
+
+The F9P and F9H drivers are separate processes, and the kernel lets only one hold the line at a time. A line found busy is therefore treated as *work the peer is doing on this node's behalf*, not as contention: `resetGpioLine()` compares `line.consumer()` against the `gpio_reset` label both nodes request under, and returns
+
+- `kIssued` — this node drove the line;
+- `kPeerDriving` — the peer is mid-pulse, which resets this receiver too, so the caller waits out the peer's assert phase *plus* the boot before reopening (a longer wait than after its own pulse, whose assert phase it already blocked through);
+- `kSkipped` — the budget is spent, the line belongs to a third party (consumer name does not match), or the request failed. Losing the request race with the peer lands here via `EBUSY`; the reopen then fails and the backoff retries, which is safe either way.
+
+The GPIO **chip** handle, by contrast, is opened in the constructor and released only in the destructor — deliberately not in `on_configure`/`on_cleanup`. The hardware reset is the last recovery step available, and it is needed precisely when the node has been cleaned up and a re-configure has failed; a chip handle scoped to the configured state would already be gone at that point, and every pulse attempt would fail with `object not holding a GPIO chip handle`. Holding the chip open claims no line and blocks no other consumer.
+
+## Tests
+
+- `test/watchdog_test.cpp` — unit tests for the **legacy** `Watchdog` class (`watchdog.hpp`), retained only to keep that header verified while it remains in tree; the driver itself no longer uses it. Covers: dropout triggers the callback, a live link does not, a persistent outage re-fires bounded, and the timeout/check-interval fields are race-free under concurrent updates. Runs anywhere (header-only, no device).
+- `test/lifecycle_test.cpp` — drives `UbloxNode` through its states. The device-independent cases (construct → UNCONFIGURED, configure-without-device fails safe, shutdown-from-unconfigured) run in CI; the full configure → activate → deactivate → cleanup → reconfigure → reactivate ladder runs only when `UBLOX_TEST_DEVICE=/dev/<receiver>` is set, and is skipped otherwise.
