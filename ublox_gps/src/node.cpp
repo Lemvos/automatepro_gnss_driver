@@ -1156,6 +1156,15 @@ UbloxNode::on_deactivate(const rclcpp_lifecycle::State & state)
       // Disarm the comms-liveness watchdog (timer keeps running but stops checking).
       monitoring_enabled_ = false;
 
+      // Drop any armed retry too, so an operator-initiated deactivate sticks:
+      // otherwise the next watchdog tick reconfigures and reactivates the node
+      // underneath them and it cannot be quiesced. Safe during recovery's own
+      // cycling, because recovery() re-arms after its transitions complete
+      // rather than before. recovery_stage_ is deliberately NOT reset here -
+      // reopen() deactivates on every pass, so resetting it would stop the
+      // ladder ever escalating.
+      recovery_pending_ = false;
+
       // Destroy subscribers
       fix_subscriber_.reset();
       heading_subscriber_.reset();
@@ -1205,6 +1214,10 @@ UbloxNode::on_cleanup(const rclcpp_lifecycle::State & state)
 		// Reset Updater pointer 
 		updater_.reset();		
 
+		// A pass that ended in INACTIVE leaves the retry armed, so an operator
+		// cleaning up from there needs it dropped as well (see on_deactivate).
+		recovery_pending_ = false;
+
 		// The GPIO chip is deliberately NOT closed here: recovery must be able
 		// to pulse the reset line from the unconfigured state.
     }
@@ -1230,8 +1243,9 @@ UbloxNode::on_shutdown(const rclcpp_lifecycle::State & state)
             this->get_current_state().id()
         );
 
-        // Disarm the comms-liveness watchdog.
+        // Disarm the comms-liveness watchdog and drop any armed retry.
         monitoring_enabled_ = false;
+        recovery_pending_ = false;
 
         shutdown();
     }
