@@ -65,8 +65,9 @@ ABORT_WINDOW_S=10
 
 RUN_HEADING=1
 RUN_POSITION=1
+RUN_CONTENTION=0
 RUN_START_TS=""
-# USB path currently unbound, so an interrupt can rebind it. Empty when none is.
+# USB paths currently unbound, space separated, so an interrupt can rebind them.
 FAULTED_USB=""
 
 usage() {
@@ -76,6 +77,11 @@ Usage: gnss_recovery_test.sh [--heading-only | --position-only] [-h]
   --heading-only   fault only the F9H; the F9P is left alone and its journal is
                    captured as the collateral check
   --position-only  fault only the F9P; the F9H provides the collateral check
+  --contention     fault BOTH receivers at once, so both ladders reach the
+                   hardware rung together and race for the shared reset line.
+                   The only way to exercise the peer-detection branch: with one
+                   receiver faulted the partner never loses data, so a second
+                   ladder never runs and the line is never contended.
   -h, --help       show this help and exit
 
 With no option both receivers are exercised, transient case then sustained
@@ -87,6 +93,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --heading-only)  RUN_POSITION=0 ;;
     --position-only) RUN_HEADING=0 ;;
+    --contention)    RUN_CONTENTION=1; RUN_HEADING=0; RUN_POSITION=0 ;;
     -h|--help)       usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -105,6 +112,8 @@ mark() {
 }
 
 selected() {
+  # The contention case faults both, so both must pass the strict mapping check.
+  [ "$RUN_CONTENTION" = 1 ] && return 0
   case "$1" in
     F9H) [ "$RUN_HEADING" = 1 ] ;;
     F9P) [ "$RUN_POSITION" = 1 ] ;;
@@ -193,8 +202,9 @@ cleanup() {
   # Rebinding is unconditional and idempotent: binding an already-bound
   # interface is a harmless error, leaving one unbound is not.
   if [ -n "$FAULTED_USB" ]; then
-    echo "restoring $FAULTED_USB before exit"
-    restore_rx "$FAULTED_USB"
+    echo "restoring$FAULTED_USB before exit"
+    # shellcheck disable=SC2086
+    restore_rx $FAULTED_USB
     FAULTED_USB=""
   fi
 
@@ -225,19 +235,25 @@ cleanup() {
 }
 
 fault_rx() {
-  local i
-  # Recorded before the unbind, so an interrupt between the two writes still
-  # leaves cleanup able to restore the interface.
-  FAULTED_USB=$1
-  for i in "$1:1.0" "$1:1.1"; do
-    echo -n "$i" | sudo tee "$CDC/unbind" >/dev/null 2>&1
+  local usb i
+  # Recorded before the unbind, so an interrupt between the writes still leaves
+  # cleanup able to restore every interface.
+  for usb in "$@"; do
+    FAULTED_USB="${FAULTED_USB} ${usb}"
+  done
+  for usb in "$@"; do
+    for i in "${usb}:1.0" "${usb}:1.1"; do
+      echo -n "$i" | sudo tee "$CDC/unbind" >/dev/null 2>&1
+    done
   done
 }
 
 restore_rx() {
-  local i
-  for i in "$1:1.0" "$1:1.1"; do
-    echo -n "$i" | sudo tee "$CDC/bind" >/dev/null 2>&1
+  local usb i
+  for usb in "$@"; do
+    for i in "${usb}:1.0" "${usb}:1.1"; do
+      echo -n "$i" | sudo tee "$CDC/bind" >/dev/null 2>&1
+    done
   done
   FAULTED_USB=""
 }
@@ -264,6 +280,30 @@ unit_for() { case "$1" in F9H) echo dev-automatepro-gnss-f9h ;; F9P) echo dev-au
 
 # One fault cycle: take the receiver away for the given time, give it back, then
 # wait for the driver to recover on its own.
+# Faults both receivers at once. Their watchdogs run on identical parameters, so
+# the two ladders advance in step and their hardware-rung pulses collide - one
+# node takes the line and the other must detect the peer holding it rather than
+# contend for it.
+run_contention_case() {
+  local name=$1 secs=$2 since rx
+  since=$(date '+%Y-%m-%d %H:%M:%S')
+
+  mark "$name BEGIN (usb=$F9H_USB + $F9P_USB, outage=${secs}s)"
+  fault_rx "$F9H_USB" "$F9P_USB"
+  sleep "$secs"
+  restore_rx "$F9H_USB" "$F9P_USB"
+  mark "$name RESTORED"
+
+  for rx in F9H F9P; do
+    if wait_for_recovery "$rx" "$since"; then
+      mark "$name ${rx} RECOVERED"
+    else
+      mark "$name ${rx} NO RECOVERY within ${RECOVERY_WAIT_TIMEOUT_S}s - see the log"
+    fi
+  done
+  mark "$name END"
+}
+
 run_case() {
   local name=$1 usb=$2 secs=$3 rx=$4 since unit
   since=$(date '+%Y-%m-%d %H:%M:%S')
@@ -292,8 +332,13 @@ run_case() {
 
 plan() {
   local what="both receivers"
-  [ "$RUN_POSITION" = 0 ] && what="the F9H (heading) only"
-  [ "$RUN_HEADING" = 0 ]  && what="the F9P (position) only"
+  if [ "$RUN_CONTENTION" = 1 ]; then
+    what="both receivers simultaneously (contention case)"
+  elif [ "$RUN_POSITION" = 0 ]; then
+    what="the F9H (heading) only"
+  elif [ "$RUN_HEADING" = 0 ]; then
+    what="the F9P (position) only"
+  fi
   echo "This test interrupts GNSS and will reset BOTH receivers via the shared"
   echo "line. Faulting $what."
   echo "Ctrl-C within ${ABORT_WINDOW_S}s to abort."
@@ -323,6 +368,10 @@ fi
 if [ "$RUN_POSITION" = 1 ]; then
   run_case "C_F9P_TRANSIENT" "$F9P_USB" "$TRANSIENT_OUTAGE_S" F9P || exit 1
   run_case "D_F9P_SUSTAINED" "$F9P_USB" "$SUSTAINED_OUTAGE_S" F9P || exit 1
+fi
+
+if [ "$RUN_CONTENTION" = 1 ]; then
+  run_contention_case "E_BOTH_SUSTAINED" "$SUSTAINED_OUTAGE_S"
 fi
 
 mark "RUN END"
