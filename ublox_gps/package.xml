@@ -1,14 +1,12 @@
 <?xml version="1.0"?>
 <package format='2'>
   <name>ublox_gps</name>
-  <version>2.4.0</version>
+  <version>2.5.0</version>
   <description>
      Driver for u-blox GPS devices.
   </description>
   <author>Johannes Meyer</author>
-  <maintainer email="gcross.code@icloud.com">Gareth Cross</maintainer>
-  <maintainer email="quchao@seas.upenn.edu">Chao Qu</maintainer>
-  <maintainer email="vmlane@alum.mit.edu">Veronica Lane</maintainer>
+  <maintainer email="engineering@lemvos.com">Lemvos Robotics GmbH</maintainer>
   <license>BSD</license>
   <url>http://ros.org/wiki/ublox</url>
 
